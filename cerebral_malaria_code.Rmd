@@ -1,5 +1,10 @@
 ---
 title: "Code Documentation for 'Automated Analysis of Low-Field Brain MRI in Cerebral Malaria'"
+knit: (function(input_file, encoding) {
+  out_dir <- 'docs';
+  rmarkdown::render(input_file,
+ encoding=encoding,
+ output_file=file.path(dirname(input_file), out_dir, 'index.html'))})
 author: "Danni Tu"
 date: '`r format(Sys.Date(), format = "%B %d, %Y")`'
 output:
