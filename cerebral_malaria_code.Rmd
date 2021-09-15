@@ -1,0 +1,1888 @@
+---
+title: "Code Documentation for 'Automated Analysis of Low-Field Brain MRI in Cerebral Malaria'"
+author: "Danni Tu"
+date: '`r format(Sys.Date(), format = "%B %d, %Y")`'
+output:
+  html_document:
+    toc: TRUE
+    code_folding: show
+    number_sections: TRUE
+bibliography: cerebral_malaria.bib
+---
+
+This document contains the analyses from the paper titled "Automated Analysis of Low-Field Brain MRI in Cerebral Malaria" [@Tu2020]. The goal of this paper was to automate the classification of brain images in children with cerebral malaria using 0.35T MRI. We pre-processed the images, constructed biomarkers of severe brain swelling, and employed a logistic regression model to predict severe cases of cerebral edema. Specifically, our pipeline consists of the following:
+
+1)  Pre-processing
+       i. N4 Bias Correction [@Tustison2010]
+      ii. Multi-atlas Label Fusion [@Doshi2013]
+2)  Biomarkers
+       i. Parenchymal Brain Fraction
+      ii. WhiteStripe Intensity [@Shinohara2014]
+     iii. Hessian Filter [@Frangi1998] 
+3)  Prediction
+     
+```{r real_setup, echo = FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE,
+                      message = FALSE, warning = FALSE,
+                      fig.align = "center", fig.width = 8, fig.height = 5)
+
+dir_cm = "/Users/dtu/Desktop/Cerebral Malaria"
+```
+     
+     
+```{r eval = TRUE}
+# Image processing
+library(ANTsR)
+library(extrantsr)
+library(neurobase)
+library(fslr)
+library(WhiteStripe)
+
+# Table/Figure formatting
+library(stargazer)
+library(pander)
+library(gridExtra)
+
+# Data analysis
+library(parallel)
+library(pROC)
+library(caret)
+library(MLeval)
+library(tidyverse)
+
+# Number of cores for parallel processing
+n_cores = 6
+
+# Set location of the raw data
+# dir_cm = folder containing all directories
+dir_nifti_train = file.path(dir_cm, "Training Set/NIFTI/") # Location of Train NIFTIs
+dir_nifti_test = file.path(dir_cm, "Test Set/NIFTI") # Location of Test NIFTIs
+
+dir_pnc = file.path(dir_cm, "PNC_Atlases") # Location of PNC Atlases
+
+dir_oasis = file.path(dir_cm, "OASIS_Atlases") # Location of OASIS Atlases
+
+# Rating data
+dat_rate_tr <- read.csv(file.path(dir_cm, "Scores_Training.csv"))
+dat_rate_te <- read.csv(file.path(dir_cm, "Scores_Test.csv"))
+dat_rate = rbind(dat_rate_tr %>% select(ID, Group),
+                 dat_rate_te %>% select(ID, Group))
+```
+
+```{r cluster_stuff, include = FALSE}
+#### FOR THE CLUSTER ONLY!!! ####
+module load fsl # load fsl if using fsl_bet
+module load R/3.6.1
+R
+
+dir_cm = "/home/dtu/Cerebral Malaria"
+
+# Image processing
+library(ANTsR)
+library(extrantsr)
+library(neurobase)
+library(fslr)
+library(WhiteStripe)
+
+# Data analysis
+library(pander)
+library(parallel)
+library(caret)
+library(MLeval)
+library(tidyverse)
+
+n_cores = as.numeric(Sys.getenv('LSB_DJOB_NUMPROC'))# Number of cores for parallel processing
+
+# Set location of the raw data
+# dir_cm = folder containing all directories
+dir_nifti_train = file.path(dir_cm, "Training Set") # Location of Train NIFTIs
+dir_nifti_test = file.path(dir_cm, "Test Set") # Location of Test NIFTIs
+
+dir_pnc = file.path(dir_cm, "PNC_Atlases") # Location of PNC Atlases
+
+dir_oasis = file.path(dir_cm, "OASIS_Atlases") # Location of OASIS Atlases
+```
+
+```{r helper_funs, eval = TRUE}
+# Overall helper functions
+
+# Create a specified folder, print message otherwise
+make_folder <- function(folder_name){
+  folder_name = paste0(folder_name)
+  if (!dir.exists(folder_name)){
+    dir.create(folder_name)
+  } else {
+    message(paste0("Folder ", folder_name, " already exists"))
+  }
+}
+
+# Print pandoc table
+pt <- function(tab){
+  tab %>% pandoc.table(split.table = Inf)
+}
+
+# Get subject ID from a filename
+find_name <- function(strs){
+  
+  strs %>%
+    map(~gsub(pattern = "mv_", replacement = "", x = .x)) %>%
+    map(~str_split(string = nii.stub(.x, bn = TRUE), pattern = "_")[[1]][1]) %>%
+    unlist
+
+}
+
+```
+
+# Pre-processing
+
+```{r}
+# Make directories and add input files
+
+make_folder(file.path(dir_nifti_train, "T1"))
+make_folder(file.path(dir_nifti_train, "T2"))
+make_folder(file.path(dir_nifti_train, "T1/Raw_Uncorrected")) # Raw MRI scans here
+make_folder(file.path(dir_nifti_train, "T2/Raw_Uncorrected")) # Raw MRI scans here
+make_folder(file.path(dir_nifti_train, "atlas"))
+make_folder(file.path(dir_nifti_train, "mask"))
+
+make_folder(file.path(dir_nifti_test, "T1"))
+make_folder(file.path(dir_nifti_test, "T2"))
+make_folder(file.path(dir_nifti_test, "T1/Raw_Uncorrected")) # Raw MRI scans here
+make_folder(file.path(dir_nifti_test, "T2/Raw_Uncorrected")) # Raw MRI scans here
+make_folder(file.path(dir_nifti_test, "atlas"))
+make_folder(file.path(dir_nifti_test, "mask"))
+
+make_folder(file.path(dir_pnc, "atlas"))
+make_folder(file.path(dir_pnc, "mask")) # PNC masks go here; no bias correction for masks
+make_folder(file.path(dir_pnc, "atlas/Raw_Uncorrected")) # PNC atlases go here
+
+make_folder(file.path(dir_pnc, "atlas"))
+make_folder(file.path(dir_pnc, "mask")) # PNC masks go here; no bias correction for masks
+make_folder(file.path(dir_pnc, "atlas/Raw_Uncorrected")) # PNC atlases go here
+
+make_folder(file.path(dir_oasis, "atlas"))
+make_folder(file.path(dir_oasis, "mask")) # PNC masks go here; no bias correction for masks
+make_folder(file.path(dir_oasis, "atlas/Raw_Uncorrected")) # PNC atlases go here
+
+make_folder(file.path(dir_cm, "Biomarkers"))
+```
+
+## N4 Bias Correction
+
+```{r}
+# fname: complete name and path of NIFTI file
+# out_dir: directory to save the bias corrected images
+bias_correction <- function(fname, out_dir){
+  temp <- readnii(fname) %>%
+    bias_correct(correction = "N4")
+
+  antsImageWrite(temp, filename = file.path(out_dir, basename(fname)))
+}
+
+# Bias correct all cerebral malaria images
+list.files(file.path(dir_nifti_train, "T1/Raw_Uncorrected"), full.names = TRUE) %>%
+  map(bias_correction, out_dir = file.path(dir_nifti_train, "T1"))
+list.files(file.path(dir_nifti_train, "T2/Raw_Uncorrected"), full.names = TRUE) %>%
+  map(bias_correction, out_dir = file.path(dir_nifti_train, "T2"))
+
+list.files(file.path(dir_nifti_test, "T1/Raw_Uncorrected"), full.names = TRUE) %>%
+  map(bias_correction, out_dir = file.path(dir_nifti_test, "T1"))
+list.files(file.path(dir_nifti_test, "T2/Raw_Uncorrected"), full.names = TRUE) %>%
+  map(bias_correction, out_dir = file.path(dir_nifti_test, "T2"))
+
+# Bias correct all PNC Atlases
+list.files(file.path(dir_pnc, "atlas/Raw_Uncorrected"), full.names = TRUE) %>%
+  map(bias_correction, out_dir = file.path(dir_pnc, "atlas"))
+
+# Bias correct all OASIS Atlases
+list.files(file.path(dir_oasis, "atlas/Raw_Uncorrected"), full.names = TRUE) %>%
+  map(bias_correction, out_dir = file.path(dir_oasis, "atlas"))
+
+```
+
+## Multi-Atlas Label Fusion
+
+### Register PNC atlases/masks to T1
+
+```{r}
+# Make directories for MALF output
+make_folder(file.path(dir_nifti_train, "atlas/MALF"))
+make_folder(file.path(dir_nifti_train, "mask/MALF"))
+
+make_folder(file.path(dir_nifti_test, "atlas/MALF"))
+make_folder(file.path(dir_nifti_test, "mask/MALF"))
+
+# Not called directly
+# fname: filename of the target image
+# atlas_files/mask_files: vector of filepaths
+# atlas_outfolder/mask_outfolder: location to save the registered atlases and masks
+register_it <- function(fname, atlas_files, mask_files, atlas_outfolder, mask_outfolder){
+  tar_name = nii.stub(fname, bn = TRUE)
+  
+  # Register everything to reg_base
+  reg_base = readnii(fname)
+  
+  # Create run_folder if it doesn't already exist
+  reg_base_dir_a = paste0(atlas_outfolder, "/", tar_name, "/")
+  reg_base_dir_m = paste0(mask_outfolder, "/", tar_name, "/")
+  
+  make_folder(reg_base_dir_a)
+  make_folder(reg_base_dir_m)
+  
+  message(paste0("Registering to ", tar_name))
+  
+  # For each raw atlas and mask... register it to target[j]
+  for (j in 1:length(atlas_files)){
+    atlas_filepath = atlas_files[j]
+    mask_filepath = mask_files[j]
+    
+    # Check atlas/mask match
+    stopifnot(grepl(nii.stub(atlas_filepath, bn = TRUE) %>% gsub(pattern = "mprage_LPS", replacement = ""),
+                    nii.stub(mask_filepath, bn = TRUE)))
+    
+    # Registration
+    atlas_to_image = registration(filename = atlas_filepath,
+                                  correct = FALSE,
+                                  template.file = reg_base,
+                                  typeofTransform = "SyN", remove.warp = FALSE,
+                                  verbose = FALSE)
+    
+    # Apply transform to atlas and mask
+    atlas_reg = antsApplyTransforms(fixed = oro2ants(reg_base), 
+                                    moving = oro2ants(readnii(atlas_filepath)),
+                                    transformlist = atlas_to_image$fwdtransforms, 
+                                    interpolator = "nearestNeighbor")
+    mask_reg = antsApplyTransforms(fixed = oro2ants(reg_base), 
+                                   moving = oro2ants(readnii(mask_filepath)),
+                                   transformlist = atlas_to_image$fwdtransforms, 
+                                   interpolator = "nearestNeighbor")
+    
+    # Outfile names 
+    atlas_out_dir = paste0(reg_base_dir_a, "/reg_", basename(atlas_filepath))
+    mask_out_dir = paste0(reg_base_dir_m, "/reg_", basename(mask_filepath))
+    
+    # Output registered images
+    antsImageWrite(atlas_reg, atlas_out_dir)
+    antsImageWrite(mask_reg, mask_out_dir)
+    
+    message("Finished atlas ", j)
+  }
+}
+
+# Registration
+# target_folder: folder containing all the T1 files
+# target_indices: subset of files in target_folder to process
+# dir_atlas/dir_mask: location of PNC atlases and masks
+# atlas_outfolder/mask_outfolder: location to save the registered atlases and masks
+register_it_wrap <- function(target_folder, 
+                             target_indices = NULL,
+                             dir_atlas = file.path(dir_pnc, "atlas"),
+                             dir_mask = file.path(dir_pnc, "mask"),
+                             atlas_outfolder,
+                             mask_outfolder){
+  
+  target_files = list.files(target_folder, pattern = ".nii.gz", full.names = TRUE)
+  
+  atlas_files = list.files(dir_atlas, pattern = ".nii.gz", full.names = TRUE) %>% sort
+  mask_files = list.files(dir_mask, pattern = ".nii.gz", full.names = TRUE) %>% sort
+  
+  # If target_indices are provided, only run on certain target files
+  if (!missing(target_indices)){
+    target_files = target_files[target_indices]
+  }
+  
+  for (i in 1:length(target_files)){
+    register_it(target_files[i],
+                atlas_files = atlas_files,
+                mask_files = mask_files,
+                atlas_outfolder = atlas_outfolder,
+                mask_outfolder = mask_outfolder)
+  }
+}
+
+# Training data
+register_it_wrap(target_folder = file.path(dir_nifti_train, "T1"),
+                 atlas_outfolder = file.path(dir_nifti_train, "atlas/MALF"),
+                 mask_outfolder= file.path(dir_nifti_train, "mask/MALF"))
+# Testing data
+register_it_wrap(target_folder = file.path(dir_nifti_test, "T1"),
+                 atlas_outfolder = file.path(dir_nifti_test, "atlas/MALF"),
+                 mask_outfolder= file.path(dir_nifti_test, "mask/MALF"))
+
+```
+
+```{r delete_cluster1, echo = FALSE}
+# Training data: 49 files
+register_it_wrap(target_folder = file.path(dir_nifti_train, "T1"),
+                 target_indices = 1:10,
+                 atlas_outfolder = file.path(dir_nifti_train, "atlas/MALF"),
+                 mask_outfolder= file.path(dir_nifti_train, "mask/MALF"))
+
+register_it_wrap(target_folder = file.path(dir_nifti_train, "T1"),
+                 target_indices = 11:20,
+                 atlas_outfolder = file.path(dir_nifti_train, "atlas/MALF"),
+                 mask_outfolder= file.path(dir_nifti_train, "mask/MALF"))
+
+register_it_wrap(target_folder = file.path(dir_nifti_train, "T1"),
+                 target_indices = 21:30,
+                 atlas_outfolder = file.path(dir_nifti_train, "atlas/MALF"),
+                 mask_outfolder= file.path(dir_nifti_train, "mask/MALF"))
+
+register_it_wrap(target_folder = file.path(dir_nifti_train, "T1"),
+                 target_indices = 31:40,
+                 atlas_outfolder = file.path(dir_nifti_train, "atlas/MALF"),
+                 mask_outfolder= file.path(dir_nifti_train, "mask/MALF"))
+
+register_it_wrap(target_folder = file.path(dir_nifti_train, "T1"),
+                 target_indices = 41:49,
+                 atlas_outfolder = file.path(dir_nifti_train, "atlas/MALF"),
+                 mask_outfolder= file.path(dir_nifti_train, "mask/MALF"))
+
+# Testing data: 46 files
+register_it_wrap(target_folder = file.path(dir_nifti_test, "T1"),
+                 target_indices = 1:10,
+                 atlas_outfolder = file.path(dir_nifti_test, "atlas/MALF"),
+                 mask_outfolder= file.path(dir_nifti_test, "mask/MALF"))
+
+register_it_wrap(target_folder = file.path(dir_nifti_test, "T1"),
+                 target_indices = 11:20,
+                 atlas_outfolder = file.path(dir_nifti_test, "atlas/MALF"),
+                 mask_outfolder= file.path(dir_nifti_test, "mask/MALF"))
+
+register_it_wrap(target_folder = file.path(dir_nifti_test, "T1"),
+                 target_indices = 21:30,
+                 atlas_outfolder = file.path(dir_nifti_test, "atlas/MALF"),
+                 mask_outfolder= file.path(dir_nifti_test, "mask/MALF"))
+
+register_it_wrap(target_folder = file.path(dir_nifti_test, "T1"),
+                 target_indices = 31:40,
+                 atlas_outfolder = file.path(dir_nifti_test, "atlas/MALF"),
+                 mask_outfolder= file.path(dir_nifti_test, "mask/MALF"))
+
+register_it_wrap(target_folder = file.path(dir_nifti_test, "T1"),
+                 target_indices = 41:46,
+                 atlas_outfolder = file.path(dir_nifti_test, "atlas/MALF"),
+                 mask_outfolder= file.path(dir_nifti_test, "mask/MALF"))
+```
+
+
+### Majority Voting
+
+```{r}
+# Store output of MALF for brain segmentation
+make_folder(file.path(dir_nifti_train, "out"))
+make_folder(file.path(dir_nifti_test, "out"))
+make_folder(file.path(dir_pnc, "out"))
+
+make_folder(file.path(dir_nifti_train, "out/MALF_Brain"))
+make_folder(file.path(dir_nifti_test, "out/MALF_Brain"))
+
+# Majority voting
+# reg_mask_folder: name of the folder for one subject containing all of their registered masks
+majority_vote <- function(reg_mask_folder, outfolder){
+  
+  target_name = basename(reg_mask_folder)
+  reg_mask_files = list.files(reg_mask_folder, full.name = TRUE)
+
+  # For every mask file in that folder, do majority voting
+  temp_mask <- readnii(reg_mask_files[1])
+  for (i in 2:length(reg_mask_files)){
+    temp_mask <- temp_mask + readnii(reg_mask_files[i])
+  }
+
+  # Save the majority voted masks
+  out_mv_mask = temp_mask > (length(reg_mask_files)/2)
+  
+  writenii(out_mv_mask,
+           file = paste0(outfolder, "/mv_", target_name, ".nii.gz"))
+  
+  return()
+}
+
+mclapply(X = list.files(file.path(dir_nifti_train, "mask/MALF"), full.names = TRUE),
+         FUN = majority_vote,
+         outfolder = file.path(dir_nifti_train, "out/MALF_Brain"),
+         mc.cores = n_cores)
+
+mclapply(X = list.files(file.path(dir_nifti_test, "mask/MALF"), full.names = TRUE),
+         FUN = majority_vote,
+         file.path(dir_nifti_test, "out/MALF_Brain"),
+         mc.cores = n_cores)
+```
+
+### Skull Strip the T1s
+
+Finally, we skull strip the T1s:
+
+```{r}
+make_folder(file.path(dir_nifti_train, "T1/Strip_MALF"))
+make_folder(file.path(dir_nifti_test, "T1/Strip_MALF"))
+
+apply_mask <- function(fname, mask_fname, strip_outdir){
+  message(fname)
+  message(mask_fname)
+  
+  brain <- readnii(fname)
+  mask <- readnii(mask_fname)
+  
+  # Skull stripped brain
+  brain_ss <- brain*mask
+  
+  writenii(brain_ss, file.path(strip_outdir, basename(fname)))
+}
+
+purrr::map2(.x = list.files(file.path(dir_nifti_train, "T1"), pattern = ".nii.gz", full.names = TRUE) %>% sort,
+     .y = list.files(file.path(dir_nifti_train, "out/MALF_Brain"), pattern = ".nii.gz", full.names = TRUE) %>% sort,
+     ~apply_mask(fname = .x, mask_fname = .y, 
+                 strip_outdir = file.path(dir_nifti_train, "T1/Strip_MALF")))
+
+purrr::map2(.x = list.files(file.path(dir_nifti_test, "T1"), pattern = ".nii.gz", full.names = TRUE) %>% sort,
+     .y = list.files(file.path(dir_nifti_test, "out/MALF_Brain"), pattern = ".nii.gz", full.names = TRUE) %>% sort,
+     ~apply_mask(fname = .x, mask_fname = .y, 
+                 strip_outdir = file.path(dir_nifti_test, "T1/Strip_MALF")))
+
+
+```
+
+
+## BET Segmentation
+
+BET Segmentation [@Smith2002] was not used in our pipeline, but was given as an alternative method of brain segmentation.
+
+```{r}
+make_folder(file.path(dir_nifti_train, "out/BET_Brain"))
+make_folder(file.path(dir_nifti_test, "out/BET_Brain"))
+make_folder(file.path(dir_pnc, "out/BET_Brain"))
+
+# fname: path to NIFTI file
+# outfolder: output directory
+bet_seg <- function(fname, outfolder){
+  
+  fname2 = basename(fname)
+  brain <- readnii(fname)
+  
+  stripped <- fsl_bet(brain, outfile = paste0(outfolder, "/betstrip_", fname2))
+  message("Done")
+  mask <- readnii(paste0(outfolder, "/betstrip_", fname2)) > 0
+  writenii(mask, filename = paste0(outfolder, "/betmask_", fname2))
+}
+
+# Train T1s
+mclapply(X = list.files(file.path(dir_nifti_train, "T1"), pattern = ".nii.gz", full.names = TRUE),
+         FUN = bet_seg,
+         outfolder = file.path(dir_nifti_train, "out/BET_Brain"),
+         mc.cores = n_cores)
+# Test T1s
+mclapply(X = list.files(file.path(dir_nifti_test, "T1"), pattern = ".nii.gz", full.names = TRUE),
+         FUN = bet_seg,
+         outfolder = file.path(dir_nifti_test, "out/BET_Brain"),
+         mc.cores = n_cores)
+
+# T1's from PNC
+mclapply(X = list.files(file.path(dir_pnc, "atlas/Raw_Uncorrected"), pattern = ".nii.gz", full.names = TRUE),
+         FUN = bet_seg,
+         outfolder = file.path(dir_pnc, "out/BET_Brain"),
+         mc.cores = n_cores)
+```
+
+## BSE Segmentation
+
+This was run in the BrainSuite app.
+
+## ANTs Segmentation
+
+ANTs Segmentation with Atropos [@Avants2011] was not used in our pipeline, but was given as an alternative method of brain segmentation.
+
+```{r}
+make_folder(file.path(dir_nifti_train, "out/ANTs_Brain"))
+make_folder(file.path(dir_nifti_test, "out/ANTs_Brain"))
+make_folder(file.path(dir_pnc, "out/ANTs_Brain"))
+
+# fname: path to NIFTI file
+# outfolder: output directory
+ants_seg <- function(fname, outfolder){
+
+  fname2 <- basename(fname)
+  brain <- readnii(fname)
+  
+  stripped = extrantsr::otropos2(
+    img = brain,
+    mask = brain > 0,
+    verbose = TRUE,
+    i = "KMeans[1]")
+  
+  writenii(stripped$segmentation, filename = paste0(outfolder, "/delete_kmeans.nii.gz"))
+  
+  message("Done")
+  table(stripped$segmentation)
+  mask = (stripped$segmentation == 1)
+  
+
+  ####################
+  
+  fname2 = basename(fname)
+  brain <- antsImageRead(fname)
+  brain_mask <- get_mask(brain)
+  
+  stripped <- atropos(a = brain, x = brain_mask)
+  message("Done")
+  mask <- readnii(paste0(outfolder, "/betstrip_", fname2)) > 0
+  writenii(mask, filename = paste0(outfolder, "/betmask_", fname2))
+}
+
+# Train T1s
+mclapply(X = list.files(file.path(dir_nifti_train, "T1"), pattern = ".nii.gz", full.names = TRUE)[1:2],
+         FUN = bet_seg,
+         outfolder = file.path(dir_nifti_train, "out/ANTs_Brain"),
+         mc.cores = n_cores)
+# Test T1s
+mclapply(X = list.files(file.path(dir_nifti_test, "T1"), pattern = ".nii.gz", full.names = TRUE),
+         FUN = bet_seg,
+         outfolder = file.path(dir_nifti_test, "out/ANTs_Brain"))
+
+# T1's from PNC
+list.files("/Users/dtu/Desktop/Cerebral\ Malaria/Training\ Set/NIFTI/atlas/Raw",
+           pattern = ".nii.gz", full.names = TRUE) %>%
+  map(bet_it_up, 
+      out.dir = "/Users/dtu/Desktop/Cerebral\ Malaria/Training\ Set/NIFTI/atlas/BET")
+
+```
+
+
+
+## Comparison:
+
+# Biomarkers
+
+## Ventricular CSF Volume
+
+To calculate ventricular CSF volume, we intersected a ventricle mask (using MALF on OASIS masks) and a CSF mask (using FSL FAST).
+
+### OASIS Ventricle mask
+
+First, we register the OASIS atlases to the same space as the PNC atlases:
+
+```{r}
+make_folder(file.path(dir_pnc, "atlas/Stripped"))
+
+pnc_atlas_files = list.files(file.path(dir_pnc, "atlas"), full.names = TRUE, pattern = ".nii.gz") %>% sort
+pnc_mask_files = list.files(file.path(dir_pnc, "mask"), full.names = TRUE, pattern = ".nii.gz") %>% sort
+
+# Skull-strip PNC atlases, since the OASIS atlases are skull stripped
+for (i in 1:length(pnc_atlas_files)){
+  atlas <- readnii(pnc_atlas_files[i])
+  mask <- readnii(pnc_mask_files[i])
+  
+  atlas_strip <- atlas*mask
+  
+  antsImageWrite(atlas_strip,
+                 filename = file.path(dir_pnc, "atlas/Stripped", basename(pnc_atlas_files[i])))
+}
+
+# Register OASIS ventricle atlases to the PNC brain atlases space
+atlas_strip_files = list.files(file.path(dir_pnc, "atlas/Stripped"), full.names = TRUE, pattern = ".nii.gz")
+
+register_it_wrap(target_folder = file.path(dir_pnc, "atlas/Stripped"),
+                 dir_atlas = file.path(dir_oasis, "atlas"),
+                 dir_mask = file.path(dir_oasis, "mask"),
+                 atlas_outfolder = file.path(dir_oasis, "atlas/Registered_to_PNC"),
+                 mask_outfolder= file.path(dir_oasis, "mask/Registered_to_PNC"))
+```
+
+Next, we use MALF with majority voting to create one ventricle atlas per PNC atlas:
+
+```{r}
+make_folder(file.path(dir_oasis, "mask/Ventricle_MALF"))
+
+mclapply(X = list.files(file.path(dir_oasis, "mask/Registered_to_PNC"), pattern = "mprage", full.names = TRUE),
+         FUN = majority_vote,
+         outfolder = file.path(dir_oasis, "mask/Ventricle_MALF"),
+         mc.cores = n_cores)
+```
+
+Then, we register these MALFed ventricle masks and PNC atlases to the cerebral malaria T1s, and perform MALF again to obtain a ventricle mask for each subject in our sample.
+
+```{r}
+make_folder(file.path(dir_nifti_train, "atlas/Ventricle_MALF"))
+make_folder(file.path(dir_nifti_train, "mask/Ventricle_MALF"))
+make_folder(file.path(dir_nifti_test, "atlas/Ventricle_MALF"))
+make_folder(file.path(dir_nifti_test, "mask/Ventricle_MALF"))
+
+# Training data
+register_it_wrap(target_folder = file.path(dir_nifti_train, "T1"),
+                 dir_atlas = file.path(dir_pnc, "atlas"),
+                 dir_mask = file.path(dir_oasis, "mask/Ventricle_MALF"),
+                 atlas_outfolder = file.path(dir_nifti_train, "atlas/Ventricle_MALF"),
+                 mask_outfolder= file.path(dir_nifti_train, "mask/Ventricle_MALF"))
+# Testing data
+register_it_wrap(target_folder = file.path(dir_nifti_test, "T1"),
+                 dir_atlas = file.path(dir_pnc, "atlas"),
+                 dir_mask = file.path(dir_oasis, "mask/Ventricle_MALF"),
+                 atlas_outfolder = file.path(dir_nifti_test, "atlas/Ventricle_MALF"),
+                 mask_outfolder= file.path(dir_nifti_test, "mask/Ventricle_MALF"))
+```
+
+```{r delete_cluster2, echo = FALSE}
+# Training data: 49 files
+register_it_wrap(target_folder = file.path(dir_nifti_train, "T1"),
+                 target_indices = 1:10,
+                 dir_atlas = file.path(dir_pnc, "atlas"),
+                 dir_mask = file.path(dir_oasis, "mask/Ventricle_MALF"),
+                 atlas_outfolder = file.path(dir_nifti_train, "atlas/Ventricle_MALF"),
+                 mask_outfolder= file.path(dir_nifti_train, "mask/Ventricle_MALF"))
+
+register_it_wrap(target_folder = file.path(dir_nifti_train, "T1"),
+                 target_indices = 11:20,
+                 dir_atlas = file.path(dir_pnc, "atlas"),
+                 dir_mask = file.path(dir_oasis, "mask/Ventricle_MALF"),
+                 atlas_outfolder = file.path(dir_nifti_train, "atlas/Ventricle_MALF"),
+                 mask_outfolder= file.path(dir_nifti_train, "mask/Ventricle_MALF"))
+
+register_it_wrap(target_folder = file.path(dir_nifti_train, "T1"),
+                 target_indices = 21:30,
+                 dir_atlas = file.path(dir_pnc, "atlas"),
+                 dir_mask = file.path(dir_oasis, "mask/Ventricle_MALF"),
+                 atlas_outfolder = file.path(dir_nifti_train, "atlas/Ventricle_MALF"),
+                 mask_outfolder= file.path(dir_nifti_train, "mask/Ventricle_MALF"))
+
+register_it_wrap(target_folder = file.path(dir_nifti_train, "T1"),
+                 target_indices = 31:40,
+                 dir_atlas = file.path(dir_pnc, "atlas"),
+                 dir_mask = file.path(dir_oasis, "mask/Ventricle_MALF"),
+                 atlas_outfolder = file.path(dir_nifti_train, "atlas/Ventricle_MALF"),
+                 mask_outfolder= file.path(dir_nifti_train, "mask/Ventricle_MALF"))
+
+register_it_wrap(target_folder = file.path(dir_nifti_train, "T1"),
+                 target_indices = 41:49,
+                 dir_atlas = file.path(dir_pnc, "atlas"),
+                 dir_mask = file.path(dir_oasis, "mask/Ventricle_MALF"),
+                 atlas_outfolder = file.path(dir_nifti_train, "atlas/Ventricle_MALF"),
+                 mask_outfolder= file.path(dir_nifti_train, "mask/Ventricle_MALF"))
+
+# Testing data: 46 files
+register_it_wrap(target_folder = file.path(dir_nifti_test, "T1"),
+                 target_indices = 1:10,
+                 dir_atlas = file.path(dir_pnc, "atlas"),
+                 dir_mask = file.path(dir_oasis, "mask/Ventricle_MALF"),
+                 atlas_outfolder = file.path(dir_nifti_test, "atlas/Ventricle_MALF"),
+                 mask_outfolder= file.path(dir_nifti_test, "mask/Ventricle_MALF"))
+
+register_it_wrap(target_folder = file.path(dir_nifti_test, "T1"),
+                 target_indices = 11:20,
+                 dir_atlas = file.path(dir_pnc, "atlas"),
+                 dir_mask = file.path(dir_oasis, "mask/Ventricle_MALF"),
+                 atlas_outfolder = file.path(dir_nifti_test, "atlas/Ventricle_MALF"),
+                 mask_outfolder= file.path(dir_nifti_test, "mask/Ventricle_MALF"))
+
+register_it_wrap(target_folder = file.path(dir_nifti_test, "T1"),
+                 target_indices = 21:30,
+                 dir_atlas = file.path(dir_pnc, "atlas"),
+                 dir_mask = file.path(dir_oasis, "mask/Ventricle_MALF"),
+                 atlas_outfolder = file.path(dir_nifti_test, "atlas/Ventricle_MALF"),
+                 mask_outfolder= file.path(dir_nifti_test, "mask/Ventricle_MALF"))
+
+register_it_wrap(target_folder = file.path(dir_nifti_test, "T1"),
+                 target_indices = 31:40,
+                 dir_atlas = file.path(dir_pnc, "atlas"),
+                 dir_mask = file.path(dir_oasis, "mask/Ventricle_MALF"),
+                 atlas_outfolder = file.path(dir_nifti_test, "atlas/Ventricle_MALF"),
+                 mask_outfolder= file.path(dir_nifti_test, "mask/Ventricle_MALF"))
+
+register_it_wrap(target_folder = file.path(dir_nifti_test, "T1"),
+                 target_indices = 41:46,
+                 dir_atlas = file.path(dir_pnc, "atlas"),
+                 dir_mask = file.path(dir_oasis, "mask/Ventricle_MALF"),
+                 atlas_outfolder = file.path(dir_nifti_test, "atlas/Ventricle_MALF"),
+                 mask_outfolder= file.path(dir_nifti_test, "mask/Ventricle_MALF"))
+
+```
+
+After majority voting, we obtain 1 ventricle mask per T1 cerebral malaria scan:
+
+```{r}
+make_folder(file.path(dir_nifti_train, "out/MALF_Ventricle"))
+make_folder(file.path(dir_nifti_test, "out/MALF_Ventricle"))
+
+mclapply(X = list.files(file.path(dir_nifti_train, "mask/Ventricle_MALF"), full.names = TRUE),
+         FUN = majority_vote,
+         outfolder = file.path(dir_nifti_train, "out/MALF_Ventricle"),
+         mc.cores = n_cores)
+
+mclapply(X = list.files(file.path(dir_nifti_test, "mask/Ventricle_MALF"), full.names = TRUE),
+         FUN = majority_vote,
+         file.path(dir_nifti_test, "out/MALF_Ventricle"),
+         mc.cores = n_cores)
+```
+
+
+We obtain a brain mask for the T2 cerebral malaria images by registering the T2s to the T1s and using the MALF brain mask:
+
+```{r}
+make_folder(file.path(dir_nifti_train, "T2/Strip_MALF"))
+make_folder(file.path(dir_nifti_train, "T2/Strip_MALF_Vent"))
+make_folder(file.path(dir_nifti_train, "out/MALF_Brain_T2"))
+make_folder(file.path(dir_nifti_train, "out/MALF_Ventricle_T2"))
+
+make_folder(file.path(dir_nifti_test, "T2/Strip_MALF"))
+make_folder(file.path(dir_nifti_test, "T2/Strip_MALF_Vent"))
+make_folder(file.path(dir_nifti_test, "out/MALF_Brain_T2"))
+make_folder(file.path(dir_nifti_test, "out/MALF_Ventricle_T2"))
+
+# Register the T1 to the T2
+
+# Segment T2 with a mask fit to the T1
+# t1_dir, t2_dir: locations of the T1 and T2 files
+# brain_mask_dir/vent_mask_dir: location of the brain + ventricle masks for T1, that we want to use on the T2
+# brain_mask_outdir/vent_mask_outdir: location to save the T2 masks
+# t2_brain_outdir/t2_vent_outdir: location to save the segmented T2s
+register_t1_t2 <- function(t1_dir, t2_dir, brain_mask_dir, vent_mask_dir,
+                           brain_mask_outdir, vent_mask_outdir,
+                           t2_brain_outdir, t2_vent_outdir){
+  
+  # For every T1 image,
+  t1_images = list.files(t1_dir, pattern = ".nii.gz", full.names = TRUE) %>% sort
+  t2_images = list.files(t2_dir, pattern = ".nii.gz", full.names = TRUE) %>% sort
+  malf_brain_masks = list.files(brain_mask_dir, pattern = ".nii.gz", full.names = TRUE) %>% sort
+  malf_vent_masks = list.files(vent_mask_dir, pattern = ".nii.gz", full.names = TRUE) %>% sort
+  
+  stopifnot(length(t1_images) == length(t2_images))
+  stopifnot(length(t1_images) == length(malf_brain_masks))
+  stopifnot(length(t1_images) == length(malf_vent_masks))
+  
+  for (i in 1:length(t1_images)){
+    
+    # Get the ith T1 file and extract subject ID
+    t1_filename = t1_images[i]
+    t1_id = find_name(nii.stub(t1_filename))
+    
+    message(basename(t1_filename))
+    
+    # Find a matching T2
+    t2_filename = t2_images[grep(pattern = t1_id, t2_images)]
+    
+    # If there is not exactly 1 T2 then just skip to the next i
+    if (length(t2_filename) != 1){
+      message("No T2 found. Exiting now.")
+      next()
+    }
+    
+    # Otherwise, register the T1 to the T2
+    t1_file = readnii(t1_filename)
+    t2_file = readnii(t2_filename)
+    reg = registration(filename = t1_file, 
+                       template.file = t2_file, 
+                       typeofTransform = "SyN",
+                       verbose = FALSE)
+    
+    # Apply that registration to the brain and ventricle masks
+    brain_malf_file = readnii(malf_brain_masks[i])
+    vent_malf_file = readnii(malf_vent_masks[i])
+    
+    t2_brain_mask = antsApplyTransforms(fixed = oro2ants(t2_file), 
+                                        moving = oro2ants(brain_malf_file),
+                                        transformlist = reg$fwdtransforms, 
+                                        interpolator = "nearestNeighbor")
+    t2_vent_mask = antsApplyTransforms(fixed = oro2ants(t2_file), 
+                                       moving = oro2ants(vent_malf_file),
+                                       transformlist = reg$fwdtransforms, 
+                                       interpolator = "nearestNeighbor")
+    
+    # Segment the T2
+    t2_brain_strip = ants2oro(t2_brain_mask)*t2_file
+    writenii(t2_brain_strip, filename = file.path(t2_brain_outdir, basename(t2_filename)))
+    
+    t2_vent_strip = ants2oro(t2_vent_mask)*t2_file
+    writenii(t2_vent_strip, filename = file.path(t2_vent_outdir, basename(t2_filename)))
+    
+    # Save the MALF masks too
+    writenii(ants2oro(t2_brain_mask),
+             filename = file.path(brain_mask_outdir, basename(malf_brain_masks[i])))
+    writenii(ants2oro(t2_vent_mask),
+             filename = file.path(vent_mask_outdir, basename(malf_vent_masks[i])))
+  }
+}
+
+register_t1_t2(t1_dir = file.path(dir_nifti_train, "T1"),
+               t2_dir = file.path(dir_nifti_train, "T2"),
+               brain_mask_dir = file.path(dir_nifti_train, "out/MALF_Brain"),
+               vent_mask_dir = file.path(dir_nifti_train, "out/MALF_Ventricle"),
+               brain_mask_outdir = file.path(dir_nifti_train, "out/MALF_Brain_T2"),
+               vent_mask_outdir = file.path(dir_nifti_train, "out/MALF_Ventricle_T2"),
+               t2_brain_outdir = file.path(dir_nifti_train, "T2/Strip_MALF"),
+               t2_vent_outdir = file.path(dir_nifti_train, "T2/Strip_MALF_Vent"))
+
+register_t1_t2(t1_dir = file.path(dir_nifti_test, "T1"),
+               t2_dir = file.path(dir_nifti_test, "T2"),
+               brain_mask_dir = file.path(dir_nifti_test, "out/MALF_Brain"),
+               vent_mask_dir = file.path(dir_nifti_test, "out/MALF_Ventricle"),
+               brain_mask_outdir = file.path(dir_nifti_test, "out/MALF_Brain_T2"),
+               vent_mask_outdir = file.path(dir_nifti_test, "out/MALF_Ventricle_T2"),
+               t2_brain_outdir = file.path(dir_nifti_test, "T2/Strip_MALF"),
+               t2_vent_outdir = file.path(dir_nifti_test, "T2/Strip_MALF_Vent"))
+```
+
+### FSL FAST
+
+We use FSL FAST on the T2's to get a CSF segmentation:
+
+```{r}
+make_folder(file.path(dir_nifti_train, "out/FSL_FAST")) #FSL Segmentation
+make_folder(file.path(dir_nifti_train, "out/FSL_CSF")) # CSF Segmentation
+
+make_folder(file.path(dir_nifti_test, "out/FSL_FAST"))
+make_folder(file.path(dir_nifti_test, "out/FSL_CSF"))
+
+# fname: filename of skull-stripped T2 image
+# csf_label: the label of the CSF class
+fslfast <- function(fname, csf_label = NULL,
+                    fsl_fast_outdir,
+                    fsl_csf_outdir){
+  # Read T2image
+  img = readnii(fname)
+  
+  # Do FAST
+  t2fast = fast(img, opts = "-t 2 --nobias --segments",
+                verbose = FALSE)
+  
+  message(paste0(basename(fname)))
+  # Save FSL FAST designations
+  writenii(t2fast, file.path(fsl_fast_outdir,
+                             basename(fname)))
+  
+  # Save the CSF mask in particular
+  out = t2fast
+  
+  # If csf_label is not provided, use the label with the smallest volume
+  if (missing(csf_label)){
+    out_csf_guess = table(out) %>%
+      as.data.frame %>%
+      filter(Freq == min(Freq)) %>%
+      select(out) %>%
+      `[[`(1) %>%
+      as.character() %>%
+      as.numeric()
+    
+    out[out != out_csf_guess] = 0
+  } else {
+    out[out != csf_label] = 0
+  }
+  
+  # Output image
+  writenii(out, file.path(fsl_csf_outdir,
+                             basename(fname)))
+}
+
+parallel::mclapply(X = list.files(file.path(dir_nifti_train, "T2/Strip_MALF"), full.names = TRUE), 
+                   FUN = fslfast,
+                   fsl_fast_outdir = file.path(dir_nifti_train, "out/FSL_FAST"),
+                   fsl_csf_outdir = file.path(dir_nifti_train, "out/FSL_CSF"),
+                   mc.cores = n_cores)
+
+parallel::mclapply(X = list.files(file.path(dir_nifti_test, "T2/Strip_MALF"), full.names = TRUE), 
+                   FUN = fslfast,
+                   fsl_fast_outdir = file.path(dir_nifti_test, "out/FSL_FAST"),
+                   fsl_csf_outdir = file.path(dir_nifti_test, "out/FSL_CSF"),
+                   mc.cores = n_cores)
+```
+
+### Ventricular CSF Mask
+
+Then, the masks from 2.1.1 and 2.1.2 were intersected to produce ventricular CSF masks:
+
+```{r}
+make_folder(file.path(dir_nifti_train, "out/Ventricle_CSF_T2"))
+make_folder(file.path(dir_nifti_test, "out/Ventricle_CSF_T2"))
+
+mask_intersect <- function(mask_fname1, mask_fname2, mask_outdir){
+  mask1 = readnii(mask_fname1)
+  mask2 = readnii(mask_fname2)
+  
+  mask_intersect = mask1 * mask2
+  # Rescale to 0s and 1s
+  mask_intersect[mask_intersect != 0] <- 1
+  
+  message(basename(mask_fname1))
+  writenii(mask_intersect,
+           file.path(mask_outdir, basename(mask_fname1)))
+}
+
+map2(.x = list.files(file.path(dir_nifti_train, "out/FSL_CSF"), full.names = TRUE, pattern = ".nii.gz"),
+     .y = list.files(file.path(dir_nifti_train, "out/MALF_Ventricle_T2"), full.names = TRUE, pattern = ".nii.gz"),
+     ~mask_intersect(mask_fname1 = .x, mask_fname2 = .y, mask_outdir = file.path(dir_nifti_train, "out/Ventricle_CSF_T2")))
+
+map2(.x = list.files(file.path(dir_nifti_test, "out/FSL_CSF"), full.names = TRUE, pattern = ".nii.gz"),
+     .y = list.files(file.path(dir_nifti_test, "out/MALF_Ventricle_T2"), full.names = TRUE, pattern = ".nii.gz"),
+     ~mask_intersect(mask_fname1 = .x, mask_fname2 = .y, mask_outdir = file.path(dir_nifti_test, "out/Ventricle_CSF_T2")))
+```
+
+Finally, the first biomarker is calculated as the brain parenchymal fraction (BPF), or the proportion of non-ventricular CSF volume to total brain volume.
+
+```{r}
+
+# Calculate volumes in a CSF-segmented file
+# vent_csf_fname: path to ventricular CSF mask
+# brain_mask_fname: path to brain_mask_fname
+volume_fun <- function(vent_csf_fname, brain_mask_fname){
+  
+  message(find_name(vent_csf_fname))
+  
+  csf = readnii(vent_csf_fname)
+  # CSF voxel resolution
+  vr = voxres(csf, units = "cm")[[1]]
+  # Get the CSF voxels
+  vox_csf = table(csf[csf != 0]) %>% as.vector
+  vol_csf = vox_csf*vr
+
+  # Get the total brain voxels
+  seg = readnii(brain_mask_fname)
+  # Stripped brain voxel resolution
+  vr2 = voxres(seg, units = "cm")[[1]]
+  # Get the brain voxels from the brain mask
+  vox_tot = table(seg) %>%
+    as.data.frame() %>%
+    mutate_all(as.character) %>%
+    mutate_all(as.numeric) %>%
+    filter(seg > 0) %>%
+    select(Freq) %>%
+    `[[`(1) %>%
+    sum
+  vol_tot = vox_tot*vr2
+  
+  # Ensure that the two files have the same dimension
+  stopifnot(all(seg@dim_ == csf@dim_))
+  stopifnot(grepl(pattern = find_name(vent_csf_fname),
+                  x = find_name(brain_mask_fname)))
+
+  # BPF = brain parenchymal fraction
+  bpf = 1-(vol_csf/vol_tot)
+
+  out = data.frame(ID = find_name(vent_csf_fname),
+                   Volume_CSF = vol_csf,
+                   Volume_Brain = vol_tot,
+                   BPF = bpf) %>%
+    mutate(ID = as.character(ID)) %>%
+    mutate_at(vars(Volume_CSF:BPF), as.numeric)
+  
+  return(out)
+}
+
+b1_vent_csf_train = map2(.x = list.files(file.path(dir_nifti_train, "out/Ventricle_CSF_T2"), pattern = ".nii.gz", full.names = TRUE),
+     .y = list.files(file.path(dir_nifti_train, "out/MALF_Brain_T2"), pattern = ".nii.gz", full.names = TRUE),
+     volume_fun) %>%
+  Reduce(rbind, .)
+
+b1_vent_csf_test = map2(.x = list.files(file.path(dir_nifti_test, "out/Ventricle_CSF_T2"), pattern = ".nii.gz", full.names = TRUE),
+     .y = list.files(file.path(dir_nifti_test, "out/MALF_Brain_T2"), pattern = ".nii.gz", full.names = TRUE),
+     volume_fun) %>%
+  Reduce(rbind, .)
+
+rbind(b1_vent_csf_train, b1_vent_csf_test) %>%
+  write_csv(file.path(dir_cm, "Biomarkers/b1_vent_csf.csv"))
+
+```
+
+
+```{r echo = FALSE}
+
+# # Plot and display results
+# csf_output <- function(dat, 
+#                        xlabel = "1-(Proportion of Ventricular CSF)", 
+#                        ylabel = "Frequency",
+#                        filllabel = "Edema Score",
+#                        title_main = "Ventricular CSF by Edema Score Category",
+#                        title_pval = TRUE){
+#   stopifnot(("ID" %in% colnames(dat)) & ("BPF" %in% colnames(dat)))
+#   
+#   pandoc.table(dat, split.table = Inf)
+#   
+#   plot_title <- if (!title_pval){
+#     title_main
+#   } else {
+#     bpf1 <- dat %>%
+#       filter(Severe_Swelling == 0) %>%
+#       select(BPF) %>%
+#       `[[`(1)
+#     
+#     bpf2 <- dat %>%
+#     filter(Severe_Swelling == 1) %>%
+#       select(BPF) %>%
+#       `[[`(1)
+# 
+#     paste0(title_main, "\n", "p = ", round(t.test(bpf1, bpf2)$p.value, 4))
+#   }
+#   
+#   ggplot() +
+#   geom_histogram(data = dat %>% filter(Severe_Swelling == 1),
+#                  aes(x = BPF, fill = "7-8"), alpha = 0.5, bins = 20) +
+#   geom_histogram(data = dat %>% filter(Severe_Swelling == 0),
+#                  aes(x = BPF, fill = "1-6"), alpha = 0.5, bins = 20) +
+#   labs(fill = filllabel,
+#        x = xlabel,
+#        y = ylabel,
+#        title = plot_title) +
+#   scale_fill_manual(breaks = c("1-6", "7-8"),
+#                     values = c("steelblue3", "indianred3")) +
+#   theme_minimal()
+# }
+# 
+# # For CSF masks in csf_dir
+# # Brain masks in brainmask_dir
+# # Calculate the BPF for each pair of CSF/Brain mask
+# # Name the file based on patt
+# volume_output <- function(csf_dir, brainmask_dir, 
+#                           volume_outname, patt = "TRAIN"){
+#   # Get list of CSF masks
+#   csf_mask_list = list.files(csf_dir, pattern = ".nii.gz", full.names = TRUE) %>% 
+#     as.list()
+#   
+#   # Get list of brain masks
+#   brain_mask_list = list.files(brainmask_dir, pattern = ".nii.gz", full.names = TRUE) %>% 
+#     as.list()
+#   
+#   stopifnot(length(csf_mask_list) == length(brain_mask_list))
+#   
+#   # Map these into volume_fun and output a nice CSV with all the info
+#   map2(csf_mask_list, brain_mask_list, volume_fun, pattern = patt) %>%
+#   bind_rows %>%
+#   write.csv(file = volume_outname)
+#   
+#   message(paste0("File written to ", volume_outname))
+# }
+# 
+# # Read in a dataset from the volume_filename
+# # Plot the results
+# volume_plot <- function(volume_filename){
+#   dat <- read.csv(volume_filename) %>%
+#   select(ID,
+#          Volume_CSF,
+#          Volume_Brain,
+#          BPF) %>%
+#   left_join(dat_rat, by = "ID") %>%
+#   arrange(desc(Group)) %>%
+#   # Severe swelling indicator
+#   mutate(Severe_Swelling = ifelse(Group >= 7.0, 1, 0),
+#          Severe_Swelling = as.factor(Severe_Swelling))
+#   
+#   dat %>%
+#   csf_output(xlabel = "1 - (Proportion of Ventricular CSF)",
+#         title_main = "Ventricular CSF by Edema Score Category")
+# }
+
+```
+
+## WhiteStripe Intensity
+
+Next, we normalize the voxel intensities within the brain using WhiteStripe:
+
+```{r}
+make_folder(file.path(dir_nifti_train, "T1/WhiteStriped"))
+make_folder(file.path(dir_nifti_train, "T2/WhiteStriped"))
+
+make_folder(file.path(dir_nifti_test, "T1/WhiteStriped"))
+make_folder(file.path(dir_nifti_test, "T2/WhiteStriped"))
+
+
+# fname: location of the skull-stripped T1s and T2
+# ws_outdir: location to save the WhiteStriped brain
+ws_intensity_norm <- function(fname, ws_outdir, the_type = "T1"){
+  brain <- readnii(fname)
+  brain_ind <- whitestripe(img = brain, type = the_type)
+  brain_ws <- whitestripe_norm(brain, indices = brain_ind$whitestripe.ind)
+  
+  writenii(brain_ws, file.path(ws_outdir, basename(fname)))
+}
+
+mclapply(X = list.files(file.path(dir_nifti_train, "T1/Strip_MALF"), pattern = ".nii.gz", full.names = TRUE),
+         FUN = ws_intensity_norm,
+         ws_outdir = file.path(dir_nifti_train, "T1/WhiteStriped"),
+         the_type = "T1",
+         mc.cores = n_cores)
+mclapply(X = list.files(file.path(dir_nifti_train, "T2/Strip_MALF"), pattern = ".nii.gz", full.names = TRUE),
+         FUN = ws_intensity_norm,
+         ws_outdir = file.path(dir_nifti_train, "T2/WhiteStriped"),
+         the_type = "T2",
+         mc.cores = n_cores)
+
+
+mclapply(X = list.files(file.path(dir_nifti_test, "T1/Strip_MALF"), pattern = ".nii.gz", full.names = TRUE),
+         FUN = ws_intensity_norm,
+         ws_outdir = file.path(dir_nifti_test, "T1/WhiteStriped"),
+         the_type = "T1",
+         mc.cores = n_cores)
+mclapply(X = list.files(file.path(dir_nifti_test, "T2/Strip_MALF"), pattern = ".nii.gz", full.names = TRUE),
+         FUN = ws_intensity_norm,
+         ws_outdir = file.path(dir_nifti_test, "T2/WhiteStriped"),
+         the_type = "T2",
+         mc.cores = n_cores)
+```
+
+The second and third biomarker are calculated as the average intensity of the WhiteStriped T1 and T2 scans within the brain voxels.
+
+```{r}
+# Convert any brain image into a vector of values
+# fname: location of image
+# mask_fname: location of mask; if provided, consider values only within mask
+# above: if provided, only consider values above this level
+image_to_values <- function(fname, above = NULL,
+                            mask_fname = NULL){
+  brain <- readnii(fname)
+
+  # If a mask is included, read it in and apply it to brain
+  if (missing(mask_fname)|is.null(mask_fname)){
+    # Create a mask that is just all 1's
+    mask = brain > -Inf
+  } else {
+    mask = readnii(mask_fname)
+    # Ensure the dimensions match
+    stopifnot(all(brain@dim_ == mask@dim_))
+    brain <- brain*mask
+  }
+
+  brain_values = brain[mask > 0]
+
+  # If "above" is included, filter the brain to just the values above that
+  if (!missing(above)){
+    brain_values <- brain_values[brain_values > above]
+  }
+
+  return(brain_values)
+}
+
+# fname: location of brain image
+# fun: function to apply to intensity values in the brain image
+# ...: other arguments to image_to_values
+image_summary <- function(fname, fun = mean, ...){
+
+  brain_vals = image_to_values(fname = fname, ...)
+
+  out = lapply(list(brain_vals), fun, na.rm = TRUE)[[1]]
+  
+  ID = find_name(fname)
+  message(ID)
+  return(data.frame(ID, out))
+}
+
+ws_t1a = map2(.x = list.files(file.path(dir_nifti_train, "T1/WhiteStriped"), full.names = T),
+              .y = list.files(file.path(dir_nifti_train, "out/MALF_Brain"), full.names = T),
+              ~image_summary(fname = .x, fun = mean, mask_fname = .y)) %>% 
+  Reduce(rbind,.) %>%
+  rename(WS_T1 = out)
+ws_t2a = map2(.x = list.files(file.path(dir_nifti_train, "T2/WhiteStriped"), full.names = T),
+              .y = list.files(file.path(dir_nifti_train, "out/MALF_Brain_T2"), full.names = T),
+              ~image_summary(fname = .x, fun = mean, mask_fname = .y)) %>% 
+  Reduce(rbind,.) %>%
+  rename(WS_T2 = out)
+
+ws_t1b = map2(.x = list.files(file.path(dir_nifti_test, "T1/WhiteStriped"), full.names = T),
+              .y = list.files(file.path(dir_nifti_test, "out/MALF_Brain"), full.names = T),
+              ~image_summary(fname = .x, fun = mean, mask_fname = .y)) %>% 
+  Reduce(rbind,.) %>%
+  rename(WS_T1 = out)
+ws_t2b = map2(.x = list.files(file.path(dir_nifti_test, "T2/WhiteStriped"), full.names = T),
+              .y = list.files(file.path(dir_nifti_test, "out/MALF_Brain_T2"), full.names = T),
+              ~image_summary(fname = .x, fun = mean, mask_fname = .y)) %>% 
+  Reduce(rbind,.) %>%
+  rename(WS_T2 = out)
+
+rbind(full_join(ws_t1a, ws_t2a, by = "ID"),
+      full_join(ws_t1b, ws_t2b, by = "ID")) %>%
+  write_csv(file.path(dir_cm, "Biomarkers/b2_ws.csv"))
+
+```
+
+```{r}
+# Revision analysis: also look at median WhiteStripe intensity
+ws_t1a = map2(.x = list.files(file.path(dir_nifti_train, "T1/WhiteStriped"), full.names = T),
+              .y = list.files(file.path(dir_nifti_train, "out/MALF_Brain"), full.names = T),
+              ~image_summary(fname = .x, fun = median, mask_fname = .y)) %>% 
+  Reduce(rbind,.) %>%
+  rename(WS_T1_Med = out)
+ws_t2a = map2(.x = list.files(file.path(dir_nifti_train, "T2/WhiteStriped"), full.names = T),
+              .y = list.files(file.path(dir_nifti_train, "out/MALF_Brain_T2"), full.names = T),
+              ~image_summary(fname = .x, fun = median, mask_fname = .y)) %>% 
+  Reduce(rbind,.) %>%
+  rename(WS_T2_Med = out)
+
+ws_t1b = map2(.x = list.files(file.path(dir_nifti_test, "T1/WhiteStriped"), full.names = T),
+              .y = list.files(file.path(dir_nifti_test, "out/MALF_Brain"), full.names = T),
+              ~image_summary(fname = .x, fun = median, mask_fname = .y)) %>% 
+  Reduce(rbind,.) %>%
+  rename(WS_T1_Med = out)
+ws_t2b = map2(.x = list.files(file.path(dir_nifti_test, "T2/WhiteStriped"), full.names = T),
+              .y = list.files(file.path(dir_nifti_test, "out/MALF_Brain_T2"), full.names = T),
+              ~image_summary(fname = .x, fun = median, mask_fname = .y)) %>% 
+  Reduce(rbind,.) %>%
+  rename(WS_T2_Med = out)
+
+rbind(full_join(ws_t1a, ws_t2a, by = "ID"),
+      full_join(ws_t1b, ws_t2b, by = "ID")) %>%
+  write_csv(file.path(dir_cm, "Biomarkers/b2_ws_med.csv"))
+
+```
+
+
+```{r echo = FALSE}
+# # Thanks John Muschelli
+# plot_densities <- function(dens, swelling_ind,
+#                           xlab = "Raw Intensities", 
+#                           main = "Whole Brain",
+#                           range_x = NULL, range_y = NULL){
+#   
+#   if (missing(range_x)){
+#     range_x = sapply(dens, function(d) range(d$x))
+#     range_x = range(range_x)
+#   }
+#   
+#   if (missing(range_y)){
+#     range_y = sapply(dens, function(d) range(d$y))
+#     range_y = range(range_y)
+#   }
+#   
+#   line_color = ifelse(swelling_ind[1] == 1, "indianred3", "steelblue3")
+#   
+#   plot(dens[[1]], xlim = range_x, ylim = range_y, 
+#        xlab = xlab, main = main, col = alpha(line_color, 0.5))
+#   
+#   for (idens in 2:length(dens)) {
+#     line_color = ifelse(swelling_ind[idens] == 1, "indianred3", "steelblue3")
+#     lines(dens[[idens]], col = alpha(line_color, 0.5))
+#   }
+# }
+
+```
+
+## Hessian Filter
+
+Our final biomarker consists of capturing sulcal effacement via a Hessian "vesselness" filter.
+
+1. Get the middle section of T2's by chopping off the top and bottom 3 voxels in every T2.
+2. Do the same for the T2 skull-strip mask.
+3. Erode the T2 skull-strip masks so that the outside edges of the T2's are not included.
+4. *Hessian Filter* on the middle section of the T2's.
+5. *Median Filter intensity*: Calculate the median intensity of the T2 Hessian Filter, but only within the brain as defined by the eroded mask in Step 3.
+
+First, we erode the brain mask on the T2s so that only the interior cerebellum is considered: this is to reduce noise in the Hessian filter.
+
+```{r}
+make_folder(file.path(dir_nifti_train, "out/MALF_erode_T2"))
+make_folder(file.path(dir_nifti_test, "out/MALF_erode_T2"))
+
+# Erode the T2 MALF brain masks
+map2(.x = list.files(file.path(dir_nifti_train, "out/MALF_Brain_T2"), full.names = TRUE, pattern = ".nii.gz"), 
+     .y = paste0(file.path(dir_nifti_train, "out/MALF_erode_T2"), "/",
+                        list.files(file.path(dir_nifti_train, "out/MALF_Brain_T2"),
+                                   full.names = FALSE, pattern = ".nii.gz")),
+     ~fslerode(file = .x, outfile = .y))
+
+map2(.x = list.files(file.path(dir_nifti_test, "out/MALF_Brain_T2"), full.names = TRUE, pattern = ".nii.gz"), 
+     .y = paste0(file.path(dir_nifti_test, "out/MALF_erode_T2"), "/",
+                        list.files(file.path(dir_nifti_test, "out/MALF_Brain_T2"),
+                                   full.names = FALSE, pattern = ".nii.gz")),
+     ~fslerode(file = .x, outfile = .y))
+```
+
+We further shrink the eroded masks by only considering the middle slices:
+
+```{r}
+make_folder(file.path(dir_nifti_train, "out/MALF_erode2_T2"))
+make_folder(file.path(dir_nifti_train, "T2/Strip_Mid"))
+make_folder(file.path(dir_nifti_test, "out/MALF_erode2_T2"))
+make_folder(file.path(dir_nifti_test, "T2/Strip_Mid"))
+
+# Given a brain image, crop the top and bottom n voxels
+get_middle <- function(fname, crop_outdir, n_voxel_crop = 2){
+  
+  # Input 3-dimensional file
+  brain = readnii(fname)
+  
+  # Keep its header info for later
+  brain_p = pixdim(brain)
+  brain_d = datatype(brain)
+
+  # The indices you want to keep
+  ind = (n_voxel_crop + 1):(dim(brain)[3]-n_voxel_crop)
+  slice_arr = brain[,,ind]
+  brain_slice = oro.nifti::nifti(slice_arr,
+                                 datatype = brain_d,
+                                 pixdim = brain_p)
+  
+  # Write it to the right palce
+  antsImageWrite(image = brain_slice,
+                   filename = file.path(crop_outdir, basename(fname)))
+}
+
+# Get middle of the MALF_erode masks
+list.files(file.path(dir_nifti_train, "out/MALF_erode_T2"), full.names = TRUE, pattern = ".nii.gz") %>%
+   map(get_middle, 
+       crop_outdir = file.path(dir_nifti_train, "out/MALF_erode2_T2"),
+       n_voxel_crop = 3)
+
+list.files(file.path(dir_nifti_test, "out/MALF_erode_T2"), full.names = TRUE, pattern = ".nii.gz") %>%
+   map(get_middle, 
+       crop_outdir = file.path(dir_nifti_test, "out/MALF_erode2_T2"),
+       n_voxel_crop = 3)
+
+# Get middle of the T2s
+list.files(file.path(dir_nifti_train, "T2/Strip_MALF"), full.names = TRUE, pattern = ".nii.gz") %>%
+   map(get_middle, 
+       crop_outdir = file.path(dir_nifti_train, "T2/Strip_Mid"),
+       n_voxel_crop = 3)
+
+list.files(file.path(dir_nifti_test, "T2/Strip_MALF"), full.names = TRUE, pattern = ".nii.gz") %>%
+   map(get_middle, 
+       crop_outdir = file.path(dir_nifti_test, "T2/Strip_Mid"),
+       n_voxel_crop = 3)
+```
+
+Finally, we apply the Hessian filter to the T2 scan, only within the region defined by the eroded and cropped brain mask.
+
+```{r}
+make_folder(file.path(dir_nifti_train, "out/Hessian"))
+make_folder(file.path(dir_nifti_test, "out/Hessian"))
+
+# Wrapper around hess_filter
+# fname: path to skull-stripped/eroded T2 image
+# hess_outdir: path to save the Hessian filter
+hess_filter <- function(fname, min.scale = 0.5, max.scale = 0.5, hess_dim = 2, hess_outdir){
+  img = readnii(fname)
+  
+  tempinv = tempfile(pattern = "file", tmpdir = tempdir(), 
+                     fileext = ".nii.gz")
+  writenii(-1*img, tempinv)
+  tempvein = tempfile(pattern="file", tmpdir = tempdir(), fileext = ".nii.gz")
+  system(paste0("c3d ", tempinv, " -hessobj ", hess_dim, " ", min.scale, " ", max.scale, " -oo ", tempvein))
+  veinmask = readnii(tempvein)
+  
+  writenii(veinmask, 
+           filename = file.path(hess_outdir, basename(fname)))
+}
+
+
+list.files(file.path(dir_nifti_train, "T2/Strip_Mid"), full.names = TRUE) %>%
+  map(hess_filter,
+      min.scale = 0.5, max.scale = 0.5, hess_dim = 2, 
+      hess_outdir = file.path(dir_nifti_train, "out/Hessian"))
+
+list.files(file.path(dir_nifti_test, "T2/Strip_Mid"), full.names = TRUE) %>%
+  map(hess_filter,
+      min.scale = 0.5, max.scale = 0.5, hess_dim = 2, 
+      hess_outdir = file.path(dir_nifti_test, "out/Hessian"))
+
+```
+
+```{r}
+hess_t2a = map2(.x = list.files(file.path(dir_nifti_train, "out/Hessian"), full.names = T),
+              .y = list.files(file.path(dir_nifti_train, "out/MALF_erode2_T2"), full.names = T),
+              ~image_summary(fname = .x, fun = median, mask_fname = .y)) %>% 
+  Reduce(rbind,.) %>%
+  rename(Fr_T2 = out)
+
+hess_t2b = map2(.x = list.files(file.path(dir_nifti_test, "out/Hessian"), full.names = T),
+              .y = list.files(file.path(dir_nifti_test, "out/MALF_erode2_T2"), full.names = T),
+              ~image_summary(fname = .x, fun = median, mask_fname = .y)) %>% 
+  Reduce(rbind,.) %>%
+  rename(Fr_T2 = out)
+
+
+rbind(hess_t2a, hess_t2b) %>%
+  write_csv(file.path(dir_cm, "Biomarkers/b3_hessian.csv"))
+```
+
+```{r}
+# Revision analyses: also look at mean
+hess_t2a = map2(.x = list.files(file.path(dir_nifti_train, "out/Hessian"), full.names = T),
+              .y = list.files(file.path(dir_nifti_train, "out/MALF_erode2_T2"), full.names = T),
+              ~image_summary(fname = .x, fun = mean, mask_fname = .y)) %>% 
+  Reduce(rbind,.) %>%
+  rename(Fr_T2_Mean = out)
+
+hess_t2b = map2(.x = list.files(file.path(dir_nifti_test, "out/Hessian"), full.names = T),
+              .y = list.files(file.path(dir_nifti_test, "out/MALF_erode2_T2"), full.names = T),
+              ~image_summary(fname = .x, fun = mean, mask_fname = .y)) %>% 
+  Reduce(rbind,.) %>%
+  rename(Fr_T2_Mean = out)
+
+
+rbind(hess_t2a, hess_t2b) %>%
+  write_csv(file.path(dir_cm, "Biomarkers/b3_hessian_mean.csv"))
+```
+
+
+```{r echo = FALSE}
+
+# 
+# # Convert the image to an object
+# image_to_obj <- function(fname, type = "density", ...){
+#   brain_vals = image_to_values(fname = fname, ...)
+#   
+#   if (type == "density"){
+#     obj = density(brain_vals)
+#   }
+#   
+#   if (type == "histogram"){
+#     obj = hist(brain_vals)
+#   }
+#   
+#   return(obj)
+# }
+# 
+
+# 
+# frangi_plot <- function(run_folder){
+#   # Histogram of the frangi filters
+#   t1d_list <- list.files(paste0("/Users/dtu/Desktop/Cerebral Malaria/Training Set/NIFTI/out/",run_folder,"/T1"), 
+#                          pattern = ".nii.gz", full.names = TRUE) %>%
+#     as.list %>%
+#     map(image_to_obj)
+#   
+#   t2d_list <- list.files(paste0("/Users/dtu/Desktop/Cerebral Malaria/Training Set/NIFTI/out/",run_folder,"/T2"), 
+#                          pattern = ".nii.gz", full.names = TRUE)  %>%
+#     as.list %>%
+#     map(image_to_obj)
+#   # 
+#   # Plot
+#   plot_densities(t1d_list, 
+#                  t1_ss,
+#                  xlab = "Frangi-Net Mask Intensity",
+#                  main = "Frangi-Net Densities (T1) \n n = 49",
+#                  range_x = c(0-1,3))
+#   legend(1.75, 10, legend=c("7-8 (Severe)", "1-6"),
+#          title = "Edema Score",
+#          col=c("indianred3", "steelblue3"), lty=1, cex=0.8)
+#   
+#   plot_densities(t2d_list, 
+#                  t2_ss,
+#                  xlab = "Frangi-Net Mask Intensity",
+#                  main = "Frangi-Net Densities (T2) \n n = 48",
+#                  range_x = c(0-1,3))
+#   legend(1.75, 8, legend=c("7-8 (Severe)", "1-6"),
+#          title = "Edema Score",
+#          col=c("indianred3", "steelblue3"), lty=1, cex=0.8)
+# }
+
+```
+
+# Analysis
+
+## Combined Data
+
+```{r}
+dat_b1 = read.csv(file.path(dir_cm, "Biomarkers/b1_vent_csf.csv"))
+dat_b2 = read.csv(file.path(dir_cm, "Biomarkers/b2_ws.csv"))
+dat_b3 = read.csv(file.path(dir_cm, "Biomarkers/b3_hessian.csv"))
+
+dat_all = inner_join(dat_b1, dat_b2, by = "ID") %>%
+  inner_join(dat_b3, by = "ID") %>%
+  # Identify training and test sets
+    mutate(Source = ifelse(grepl(pattern = "TRAIN", x = ID), "Train", "Test"),
+         Source = factor(Source, levels = c("Train", "Test"))) %>%
+  # Join with the rating data
+  inner_join(dat_rate, by = "ID") %>%
+  # Identify severe cases by threshold
+  mutate(Severe_Edema65 = (Group >= 6.5),
+         Severe_Edema6 = (Group >= 6),
+         Severe_Edema7 = (Group >= 7))
+```
+
+```{r include = FALSE}
+write_csv(dat_all, file.path(dir_cm, "combined_data.csv"))
+```
+
+```{r}
+# Revised analyses
+dat_b1 = read.csv(file.path(dir_cm, "Biomarkers/b1_vent_csf.csv"))
+dat_b2 = read.csv(file.path(dir_cm, "Biomarkers/b2_ws.csv"))
+dat_b2_rev = read.csv(file.path(dir_cm, "Biomarkers/b2_ws_med.csv"))
+dat_b3 = read.csv(file.path(dir_cm, "Biomarkers/b3_hessian.csv"))
+dat_b3_rev = read.csv(file.path(dir_cm, "Biomarkers/b3_hessian_mean.csv"))
+
+dat_all_rev = inner_join(dat_b1, dat_b2, by = "ID") %>%
+  inner_join(dat_b2_rev, by = "ID") %>%
+  inner_join(dat_b3, by = "ID") %>%
+  inner_join(dat_b3_rev, by = "ID") %>%
+  # Identify training and test sets
+    mutate(Source = ifelse(grepl(pattern = "TRAIN", x = ID), "Train", "Test"),
+         Source = factor(Source, levels = c("Train", "Test"))) %>%
+  # Join with the rating data
+  inner_join(dat_rate, by = "ID") %>%
+  # Identify severe cases by threshold
+  mutate(Severe_Edema65 = (Group >= 6.5),
+         Severe_Edema6 = (Group >= 6),
+         Severe_Edema7 = (Group >= 7))
+```
+
+```{r include = FALSE}
+write_csv(dat_all_rev, file.path(dir_cm, "combined_data_rev.csv"))
+```
+
+```{r start_running_everything, eval = TRUE, echo = FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE,
+                      message = FALSE, warning = FALSE,
+                      fig.align = "center", fig.width = 8, fig.height = 5,
+                      results = 'asis')
+
+# Read in combined data
+dat_all = read.csv(file.path(dir_cm, "combined_data.csv"))
+
+# Biomarker names
+covs =  c("BPF", "WS_T1", "WS_T2", "Fr_T2")
+```
+
+## Logistic Model {.tabset}
+
+To predict severe cases, we used a logistic regression model:
+
+\[P(BV \geq t) = \beta_0 + \beta_1 \gamma_1 + \beta_2 \gamma_2 + \beta_3 \gamma_3 + \beta_4 \gamma_4 \]
+
+where
+
+- BV is the brain volume severity score
+- $t$ is the threshold such that $BV \geq t$ determines severely increased brain volume
+- $\gamma_1$ is the BPF
+- $\gamma_2$ is the mean WhiteStripe (T1) intensity
+- $\gamma_3$ is the mean WhiteStripe (T2) intensity
+- $\gamma_4$ is the median Hessian Filter (T2) intensity
+
+```{r}
+# Newline
+nl <- function(){
+  cat("  \n")
+}
+
+# Get outcome variable name given threshold
+get_outcome_var <- function(thresh = 7){
+  if (thresh == 7) return("Severe_Edema7")
+  if (thresh == 6) return("Severe_Edema6")
+  if (near(thresh, 6.5)) return("Severe_Edema65")
+  
+  return(NA)
+}
+
+# Get outcome formatted label given threshold
+get_outcome_labs <- function(thresh){
+  if (thresh == 7) return("Severe Edema (BV Score 7-8)")
+  if (thresh == 6) return( "Severe Edema (BV Score 6-8)")
+  if (near(thresh, 6.5)) return( "Severe Edema (BV Score 6.5-8)")
+  
+  return(NA)
+}
+
+# Get labels for a given vector of covariate names
+get_covar_labs <- function(covars){
+  covar_key = data.frame(X = c("BPF", "Mean WhiteStripe (T1)", "Mean WhiteStripe (T2)", "Median Hessian (T2)"),
+                         Y = c("BPF", "WS_T1", "WS_T2", "Fr_T2")) %>%
+    mutate_all(as.character)
+  
+  out = inner_join(data.frame(Y = covars),
+                   covar_key, by = "Y") %>%
+    select(X) %>% `[[`(1)
+  
+  return(out)
+}
+
+# dat_train: data to train the logistic model on
+# threshold: determines which cases are severe vs. non-severe
+# covars: covariates to train the logistic model on
+mod_fun <- function(dat_train, threshold = 7, covars = covs){
+  form = paste0(get_outcome_var(thresh = threshold), " ~ ",
+                paste(covars, collapse = " + ")) %>%
+    as.formula
+  fit = glm(formula = form, family = binomial, data = dat_train)
+  
+  return(list(fit = fit, threshold = threshold,
+              covars = covars))
+}
+```
+
+### t = 7
+
+```{r}
+fit = mod_fun(dat_train = dat_all, threshold = 7)
+
+stargazer(fit$fit, type = "html",
+          covariate.labels = get_covar_labs(fit$covars),
+          digits = 2, ci = TRUE, dep.var.labels = get_outcome_labs(thresh = 7))
+```
+
+### t = 6.5
+
+```{r}
+fit = mod_fun(dat_train = dat_all, threshold = 6.5)
+
+stargazer(fit$fit, type = "html",
+          covariate.labels = get_covar_labs(fit$covars),
+          digits = 2, ci = TRUE, dep.var.labels = get_outcome_labs(thresh = 7))
+```
+
+### t = 6
+
+```{r}
+fit = mod_fun(dat_train = dat_all, threshold = 6)
+
+stargazer(fit$fit, type = "html",
+          covariate.labels = get_covar_labs(fit$covars),
+          digits = 2, ci = TRUE, dep.var.labels = get_outcome_labs(thresh = 7))
+```
+
+## Accuracy: Original Train/Test Sets {.tabset}
+
+The logistic model was fit on the Training Data and then prediction accuracy was assessed on the Testing Data.
+
+```{r}
+dat_test = dat_all %>% filter(Source == "Test")
+dat_train = dat_all %>% filter(Source == "Train")
+
+model_auc <- function(dat_test, dat_train, thresh = 7,
+                      covariates = covs){
+  outcome_var = get_outcome_var(thresh = thresh)
+  
+  dat_test2 <- dat_test %>%
+    select(ID, Group, all_of(c(outcome_var, covariates)))
+  
+  dat_train2 <- dat_train %>%
+    select(ID, Group, all_of(c(outcome_var, covariates)))
+
+  # Create formula
+  form0 = paste(covariates, collapse = " + ")
+  form = paste0(outcome_var, " ~ ", form0) %>% as.formula()
+  
+  # Fit logistic regression to training data
+  fit <- glm(formula = form,
+             family = binomial,
+             data = dat_train2)
+  
+  # Calculate AUC on both training and testing data
+  roc_tr <- roc(dat_train2$Severe_Edema ~ predict(fit, type = "response"), 
+                plot = FALSE, print.auc = TRUE, quiet = TRUE, direction = "<")
+  roc_te <- roc(dat_test2$Severe_Edema ~ predict.glm(fit, newdata = dat_test2, type = "response"), 
+                plot = FALSE, print.auc = TRUE, quiet = TRUE, direction = "<")
+  # Get the AUC's as well as 95% DeLong confidence intervals
+  auc_tr <- as.numeric(ci.auc(roc_tr))
+  auc_te <- as.numeric(ci.auc(roc_te))
+  
+  # Get sensitivity and specificity
+  sens_spec_tr = data.frame(Sens = roc_tr$sensitivities,
+                            Spec = roc_tr$specificities) %>%
+    filter(Spec > 0.90) %>%
+    filter(Sens == max(Sens)) %>%
+    filter(Spec == max(Spec))
+  sens_spec_te = data.frame(Sens = roc_te$sensitivities,
+                            Spec = roc_te$specificities) %>%
+    filter(Spec > 0.90) %>%
+    filter(Sens == max(Sens)) %>%
+    filter(Spec == max(Spec))
+  
+  # Output
+  out <- data.frame(Outcome = outcome_var,
+                    Train_AUC = auc_tr[2],
+                    Train_AUC_Lower = auc_tr[1],
+                    Train_AUC_Upper = auc_tr[3],
+                    Test_AUC = auc_te[2],
+                    Test_AUC_Lower = auc_te[1],
+                    Test_AUC_Upper = auc_te[3],
+                    Train_Sens = sens_spec_tr$Sens,
+                    Train_Spec = sens_spec_tr$Spec,
+                    Test_Sens = sens_spec_te$Sens,
+                    Test_Spec = sens_spec_te$Spec)
+  
+  out_form = out %>% mutate(Threshold = thresh,
+                            Covariates = form0,
+                 AUC_train = paste0(round(Train_AUC, 2), " (", round(Train_AUC_Lower, 2), ",",
+                                    round(Train_AUC_Upper, 2),  ")"), 
+                 AUC_test = paste0(round(Test_AUC, 2), " (", round(Test_AUC_Lower, 2), ",",
+                                    round(Test_AUC_Upper, 2),  ")")) %>%
+    select(Threshold:AUC_test)
+  
+  return(list(out, out_form))
+}
+
+```
+
+### t = 7
+
+```{r}
+model_auc(dat_test = dat_test, dat_train = dat_train,
+          thresh = 7, covariates = covs)[[2]] %>% pt()
+
+model_auc(dat_test = dat_test, dat_train = dat_train,
+          thresh = 7, covariates = "Fr_T2")[[2]] %>% pt()
+```
+
+### t = 6.5
+
+```{r}
+model_auc(dat_test = dat_test, dat_train = dat_train,
+          thresh = 6.5, covariates = covs)[[2]] %>% pt()
+
+model_auc(dat_test = dat_test, dat_train = dat_train,
+          thresh = 6.5, covariates = "Fr_T2")[[2]] %>% pt()
+```
+
+### t = 6
+
+```{r}
+model_auc(dat_test = dat_test, dat_train = dat_train,
+          thresh = 6, covariates = covs)[[2]] %>% pt()
+
+model_auc(dat_test = dat_test, dat_train = dat_train,
+          thresh = 6, covariates = "Fr_T2")[[2]] %>% pt()
+```
+
+# Sensitivity Analyses
+
+## Accuracy: Cross-Validation {.tabset}
+
+To ensure that our prediction accuracy results are not due to the differences between the Training and Test sets, we assess sensitivity, specificity, AUC, etc. using 10-fold cross-validation implemented in the `caret` and `MEval` packages.
+
+```{r}
+model_auc_cv10 <- function(folds = 10, reps = 1, dat_all, thresh, covariates){
+  
+  outcome_var2 = sym(get_outcome_var(thresh = thresh))
+
+  # Convert outcome from logical to factor
+  dat_all2 = dat_all %>%
+    mutate(Outcome = ifelse(!!outcome_var2, "Severe", "NonSevere")) %>%
+    select(ID, Outcome, all_of(c(covariates)))
+  
+  train.control <- trainControl(method = "repeatedcv", 
+                                number = folds, repeats = reps,
+                                savePredictions = TRUE, 
+                                classProbs = TRUE)
+
+  # Train the model
+  form = paste0("Outcome ~", paste(covariates, collapse = " + ")) %>% as.formula()
+  model <- train(form = form, data = dat_all2, method = "glm", family = binomial,
+                 trControl = train.control)
+  
+  nl()
+  model_auc = evalm(model, plots = "r")
+  nl()
+
+  model_auc$optres[[1]] %>%
+    pandoc.table(split.table = Inf)
+  nl()
+}
+```
+
+### t = 7
+
+#### All covariates
+
+```{r}
+set.seed(123423)
+model_auc_cv10(folds = 10, reps = 1, dat_all = dat_all,
+               thresh = 7, covariates = covs)
+```
+
+#### Hessian only
+
+```{r}
+model_auc_cv10(folds = 10, reps = 1,  dat_all = dat_all,
+               thresh = 7, covariates = "Fr_T2")
+```
+
+### t = 6.5
+
+#### All covariates
+
+```{r}
+model_auc_cv10(folds = 10, reps = 1,  dat_all = dat_all,
+               thresh = 6.5, covariates = covs)
+```
+
+#### Hessian only
+
+```{r}
+model_auc_cv10(folds = 10, reps = 1,  dat_all = dat_all,
+               thresh = 6.5, covariates = "Fr_T2")
+```
+
+### t = 6
+
+#### All covariates
+
+```{r}
+model_auc_cv10(folds = 10, reps = 1,  dat_all = dat_all,
+               thresh = 6, covariates = covs)
+```
+
+#### Hessian only
+
+```{r}
+model_auc_cv10(folds = 10, reps = 1,  dat_all = dat_all,
+               thresh = 6, covariates = "Fr_T2")
+```
+
+# Figures {.tabset}
+
+### Distribution of Scores
+
+```{r eval = TRUE, fig.height = 4}
+ggplot(dat_all) +
+  geom_histogram(aes(x = Group, fill = Severe_Edema7), bins = 8) +
+  scale_x_continuous(breaks=1:8) +
+  scale_fill_manual(breaks = c("TRUE", "FALSE"), values = c("#D55E00", "#56B4E9")) +
+  facet_wrap(~Source) +
+  labs(x = "Brain Volume Score", y = "Frequency")
+```
+
+### Distribution of Biomarkers
+
+```{r eval = TRUE}
+get_outcome <- function(threshold = 7){
+  stopifnot(threshold %in% c(6, 6.5, 7))
+  if (threshold == 7) return("Severe_Edema7")
+  if (threshold == 6) return("Severe_Edema6") else return("Severe_Edema65")
+}
+
+bio_dist_plot <- function(dat_all, threshold = 7){
+  out_var = get_outcome(threshold)
+  
+  # BPF
+  p1 = ggplot(dat_all) +
+    geom_histogram(aes_string(x = "BPF", fill = out_var), bins = 20, alpha = 0.6, position="identity") +
+    scale_fill_manual(breaks = c("TRUE", "FALSE"), values = c("#D55E00", "#56B4E9")) +
+    labs(x = "BPF", y = "Count", fill = paste0("Severe Edema\n(BV geq ", threshold, ")"))
+  
+  # WhiteStripe
+  p2 = ggplot(dat_all) +
+    geom_histogram(aes_string(x = "WS_T1", fill = out_var), bins = 20, alpha = 0.6, position="identity") +
+    scale_fill_manual(breaks = c("TRUE", "FALSE"), values = c("#D55E00", "#56B4E9")) +
+    labs(x = "Mean WhiteStripe Intensity (T1)", y = "Count", fill = paste0("Severe Edema\n(BV geq ", threshold, ")"))
+  p3 = ggplot(dat_all) +
+    geom_histogram(aes_string(x = "WS_T2", fill = out_var), bins = 20, alpha = 0.6, position="identity") +
+    scale_fill_manual(breaks = c("TRUE", "FALSE"), values = c("#D55E00", "#56B4E9")) +
+    labs(x = "Mean WhiteStripe Intensity (T2)", y = "Count", fill = paste0("Severe Edema\n(BV geq ", threshold, ")"))
+  
+  # HEssian
+  p4 = ggplot(dat_all) +
+    geom_histogram(aes_string(x = "Fr_T2", fill = out_var), bins = 20, alpha = 0.6, position="identity") +
+    scale_fill_manual(breaks = c("TRUE", "FALSE"), values = c("#D55E00", "#56B4E9")) +
+    labs(x = "Median Hessian Filter Intensity (T2)", y = "Count", fill = paste0("Severe Edema\n(BV geq ", threshold, ")"))
+  
+  grid.arrange(p1, p2, p3, p4, nrow = 2)
+}
+
+```
+
+#### Threshold = 7
+
+```{r eval = TRUE}
+bio_dist_plot(dat_all, threshold = 7)
+```
+
+#### Threshold = 6.5
+
+```{r eval = TRUE}
+bio_dist_plot(dat_all, threshold = 6.5)
+```
+
+#### Threshold = 6
+
+```{r eval = TRUE}
+bio_dist_plot(dat_all, threshold = 6)
+```
+
+
+
+# References
