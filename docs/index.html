@@ -11,7 +11,7 @@
 
 <meta name="author" content="Danni Tu" />
 
-<meta name="date" content="2021-09-15" />
+<meta name="date" content="2021-12-08" />
 
 <title>Code Documentation for ‘Automated Analysis of Low-Field Brain MRI in Cerebral Malaria’</title>
 
@@ -484,12 +484,13 @@ summary {
 
 <h1 class="title toc-ignore">Code Documentation for ‘Automated Analysis of Low-Field Brain MRI in Cerebral Malaria’</h1>
 <h4 class="author">Danni Tu</h4>
-<h4 class="date">September 15, 2021</h4>
+<h4 class="date">December 08, 2021</h4>
 
 </div>
 
 <div id="TOC">
 <ul>
+<li><a href="#setup">Setup</a></li>
 <li><a href="#pre-processing"><span class="toc-section-number">1</span> Pre-processing</a><ul>
 <li><a href="#n4-bias-correction"><span class="toc-section-number">1.1</span> N4 Bias Correction</a></li>
 <li><a href="#multi-atlas-label-fusion"><span class="toc-section-number">1.2</span> Multi-Atlas Label Fusion</a><ul>
@@ -539,7 +540,7 @@ summary {
 </ul>
 </div>
 
-<p>This document contains the analyses from the paper titled “Automated Analysis of Low-Field Brain MRI in Cerebral Malaria” <span class="citation">(Tu et al. 2020)</span>. The goal of this paper was to automate the classification of brain images in children with cerebral malaria using 0.35T MRI. We pre-processed the images, constructed biomarkers of severe brain swelling, and employed a logistic regression model to predict severe cases of cerebral edema. Specifically, our pipeline consists of the following:</p>
+<p>This document contains the analyses from the paper titled “Automated Analysis of Low-Field Brain MRI in Cerebral Malaria” <span class="citation">(Tu et al. 2020)</span> <a href="https://www.biorxiv.org/content/10.1101/2020.12.23.424020v2">(bioRxiv link)</a>. The goal of this paper was to automate the classification of brain images in children with cerebral malaria using 0.35T MRI. We pre-processed the images, constructed biomarkers of severe brain swelling, and employed a logistic regression model to predict severe cases of cerebral edema. Specifically, our pipeline consists of the following steps:</p>
 <ol style="list-style-type: decimal">
 <li>Pre-processing
 <ol style="list-style-type: lower-roman">
@@ -552,7 +553,20 @@ summary {
 <li>WhiteStripe Intensity <span class="citation">(Shinohara et al. 2014)</span></li>
 <li>Hessian Filter <span class="citation">(Frangi et al. 1998)</span></li>
 </ol></li>
-<li>Prediction</li>
+<li>Prediction of severe brain swelling</li>
+</ol>
+<div id="setup" class="section level1 unnumbered">
+<h1>Setup</h1>
+<p>To use this pipeline on your own data, you will need the following:</p>
+<ol style="list-style-type: decimal">
+<li>A T1- and T2-weighted MRI image for each participant</li>
+<li>Brain atlases (open access option for pediatric atlases: <a href="http://nist.mni.mcgill.ca/pediatric-atlases-4-5-18-5y/">http://nist.mni.mcgill.ca/pediatric-atlases-4-5-18-5y/</a>)</li>
+<li>Ventricle atlases (open access option for adult atlases: <a href="https://www.oasis-brains.org/#data">https://www.oasis-brains.org/#data</a>)</li>
+</ol>
+<p>You will also need to install the following open-source software:</p>
+<ol style="list-style-type: decimal">
+<li>ANTs (<a href="http://stnava.github.io/ANTs/%5Bhttp://stnava.github.io/ANTs/%5D" class="uri">http://stnava.github.io/ANTs/[http://stnava.github.io/ANTs/]</a>)</li>
+<li>FSL (<a href="https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/%5Bhttps://fsl.fmrib.ox.ac.uk/fsl/fslwiki/%5D" class="uri">https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/[https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/]</a>)</li>
 </ol>
 <pre class="r"><code># Image processing
 library(ANTsR)
@@ -579,7 +593,7 @@ n_cores = 6
 # Set location of the raw data
 # dir_cm = folder containing all directories
 dir_nifti_train = file.path(dir_cm, &quot;Training Set/NIFTI/&quot;) # Location of Train NIFTIs
-dir_nifti_test = file.path(dir_cm, &quot;Test Set/NIFTI&quot;) # Location of Test NIFTIs
+dir_nifti_test = file.path(dir_cm, &quot;Test Set/NIFTI/&quot;) # Location of Test NIFTIs
 
 dir_pnc = file.path(dir_cm, &quot;PNC_Atlases&quot;) # Location of PNC Atlases
 
@@ -616,35 +630,33 @@ find_name &lt;- function(strs){
     unlist
 
 }</code></pre>
+</div>
 <div id="pre-processing" class="section level1">
 <h1><span class="header-section-number">1</span> Pre-processing</h1>
+<p>First, we set up our folders and ensure that all of our MRI images and atlases are at the correct location. In our data, participants were split into Training/Test sets at the outset. If your images are all in one folder, simply ignore the lines with <code>dir_nifti_test</code>.</p>
 <pre class="r"><code># Make directories and add input files
 
 make_folder(file.path(dir_nifti_train, &quot;T1&quot;))
 make_folder(file.path(dir_nifti_train, &quot;T2&quot;))
-make_folder(file.path(dir_nifti_train, &quot;T1/Raw_Uncorrected&quot;)) # Raw MRI scans here
-make_folder(file.path(dir_nifti_train, &quot;T2/Raw_Uncorrected&quot;)) # Raw MRI scans here
+make_folder(file.path(dir_nifti_train, &quot;T1/Raw_Uncorrected&quot;)) # Put Raw T1 NIFTI images here
+make_folder(file.path(dir_nifti_train, &quot;T2/Raw_Uncorrected&quot;)) # Put Raw T2 NIFTI images here
 make_folder(file.path(dir_nifti_train, &quot;atlas&quot;))
 make_folder(file.path(dir_nifti_train, &quot;mask&quot;))
 
 make_folder(file.path(dir_nifti_test, &quot;T1&quot;))
 make_folder(file.path(dir_nifti_test, &quot;T2&quot;))
-make_folder(file.path(dir_nifti_test, &quot;T1/Raw_Uncorrected&quot;)) # Raw MRI scans here
-make_folder(file.path(dir_nifti_test, &quot;T2/Raw_Uncorrected&quot;)) # Raw MRI scans here
+make_folder(file.path(dir_nifti_test, &quot;T1/Raw_Uncorrected&quot;)) # Put Raw T1 NIFTI images here
+make_folder(file.path(dir_nifti_test, &quot;T2/Raw_Uncorrected&quot;)) # Put Raw T2 NIFTI images here
 make_folder(file.path(dir_nifti_test, &quot;atlas&quot;))
 make_folder(file.path(dir_nifti_test, &quot;mask&quot;))
 
 make_folder(file.path(dir_pnc, &quot;atlas&quot;))
-make_folder(file.path(dir_pnc, &quot;mask&quot;)) # PNC masks go here; no bias correction for masks
-make_folder(file.path(dir_pnc, &quot;atlas/Raw_Uncorrected&quot;)) # PNC atlases go here
-
-make_folder(file.path(dir_pnc, &quot;atlas&quot;))
-make_folder(file.path(dir_pnc, &quot;mask&quot;)) # PNC masks go here; no bias correction for masks
-make_folder(file.path(dir_pnc, &quot;atlas/Raw_Uncorrected&quot;)) # PNC atlases go here
+make_folder(file.path(dir_pnc, &quot;mask&quot;)) # PNC brain masks go here; no bias correction for masks
+make_folder(file.path(dir_pnc, &quot;atlas/Raw_Uncorrected&quot;)) # PNC brain atlases go here
 
 make_folder(file.path(dir_oasis, &quot;atlas&quot;))
-make_folder(file.path(dir_oasis, &quot;mask&quot;)) # PNC masks go here; no bias correction for masks
-make_folder(file.path(dir_oasis, &quot;atlas/Raw_Uncorrected&quot;)) # PNC atlases go here
+make_folder(file.path(dir_oasis, &quot;mask&quot;)) # OASIS ventricle masks go here; no bias correction for masks
+make_folder(file.path(dir_oasis, &quot;atlas/Raw_Uncorrected&quot;)) # OASIS ventricle atlases go here
 
 make_folder(file.path(dir_cm, &quot;Biomarkers&quot;))</code></pre>
 <div id="n4-bias-correction" class="section level2">
@@ -658,7 +670,7 @@ bias_correction &lt;- function(fname, out_dir){
   antsImageWrite(temp, filename = file.path(out_dir, basename(fname)))
 }
 
-# Bias correct all cerebral malaria images
+# Bias correct all MRI images
 list.files(file.path(dir_nifti_train, &quot;T1/Raw_Uncorrected&quot;), full.names = TRUE) %&gt;%
   map(bias_correction, out_dir = file.path(dir_nifti_train, &quot;T1&quot;))
 list.files(file.path(dir_nifti_train, &quot;T2/Raw_Uncorrected&quot;), full.names = TRUE) %&gt;%
