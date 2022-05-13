@@ -5,6 +5,7 @@ knit: (function(input_file, encoding) {
   rmarkdown::render(input_file,
  encoding=encoding,
  output_file=file.path(dirname(input_file), out_dir, 'index.html'))})
+subtitle: "Code Documentation"
 author: "Danni Tu"
 date: '`r format(Sys.Date(), format = "%B %d, %Y")`'
 output:
@@ -15,7 +16,7 @@ output:
 bibliography: cerebral_malaria.bib
 ---
 
-This document contains the analyses from the paper titled "Automated Analysis of Low-Field Brain MRI in Cerebral Malaria" [@Tu2020] [(bioRxiv link)](https://www.biorxiv.org/content/10.1101/2020.12.23.424020v2). The goal of this paper was to automate the classification of brain images in children with cerebral malaria using 0.35T MRI. We pre-processed the images, constructed biomarkers of severe brain swelling, and employed a logistic regression model to predict severe cases of cerebral edema. Specifically, our pipeline consists of the following steps:  
+This document contains the analyses from the paper titled "Automated Analysis of Low-Field Brain MRI in Cerebral Malaria" [@Tu2020] [(bioRxiv link)](https://www.biorxiv.org/content/10.1101/2020.12.23.424020v3). The goal of this paper is to automate the classification of brain images in children with cerebral malaria using 0.35T MRI. We pre-processed the images, constructed biomarkers of severe brain swelling, and employed a logistic regression model to predict severe cases of cerebral edema. Specifically, our pipeline consists of the following steps:  
 
 1)  Pre-processing
        i. N4 Bias Correction [@Tustison2010]
@@ -44,11 +45,24 @@ knitr::opts_chunk$set(echo = TRUE, eval = FALSE,
                       message = FALSE, warning = FALSE,
                       fig.align = "center", fig.width = 8, fig.height = 5)
 
-dir_cm = "/Users/dtu/Desktop/Cerebral Malaria"
+dir_cm = "/Users/dtu/Desktop/Cerebral Malaria/Revision_Analyses"
 ```
-     
-     
-```{r eval = TRUE}
+
+```{r eval = TRUE, echo = FALSE}
+# Table/Figure formatting
+library(stargazer)
+library(pander)
+library(gridExtra)
+
+# Data analysis
+library(parallel)
+library(pROC)
+library(caret)
+library(MLeval)
+library(tidyverse)
+```
+
+```{r}
 # Image processing
 library(ANTsR)
 library(extrantsr)
@@ -67,58 +81,21 @@ library(pROC)
 library(caret)
 library(MLeval)
 library(tidyverse)
+```
 
+     
+```{r eval = TRUE}
 # Number of cores for parallel processing
 n_cores = 6
 
 # Set location of the raw data
-# dir_cm = folder containing all directories
+# dir_cm = [set this to the folder containing all directories]
 dir_nifti_train = file.path(dir_cm, "Training Set/NIFTI/") # Location of Train NIFTIs
 dir_nifti_test = file.path(dir_cm, "Test Set/NIFTI/") # Location of Test NIFTIs
 
 dir_pnc = file.path(dir_cm, "PNC_Atlases") # Location of PNC Atlases
 
 dir_oasis = file.path(dir_cm, "OASIS_Atlases") # Location of OASIS Atlases
-
-# Rating data
-dat_rate_tr <- read.csv(file.path(dir_cm, "Scores_Training.csv"))
-dat_rate_te <- read.csv(file.path(dir_cm, "Scores_Test.csv"))
-dat_rate = rbind(dat_rate_tr %>% select(ID, Group),
-                 dat_rate_te %>% select(ID, Group))
-```
-
-```{r cluster_stuff, include = FALSE}
-#### FOR THE CLUSTER ONLY!!! ####
-module load fsl # load fsl if using fsl_bet
-module load R/3.6.1
-R
-
-dir_cm = "/home/dtu/Cerebral Malaria"
-
-# Image processing
-library(ANTsR)
-library(extrantsr)
-library(neurobase)
-library(fslr)
-library(WhiteStripe)
-
-# Data analysis
-library(pander)
-library(parallel)
-library(caret)
-library(MLeval)
-library(tidyverse)
-
-n_cores = as.numeric(Sys.getenv('LSB_DJOB_NUMPROC'))# Number of cores for parallel processing
-
-# Set location of the raw data
-# dir_cm = folder containing all directories
-dir_nifti_train = file.path(dir_cm, "Training Set") # Location of Train NIFTIs
-dir_nifti_test = file.path(dir_cm, "Test Set") # Location of Test NIFTIs
-
-dir_pnc = file.path(dir_cm, "PNC_Atlases") # Location of brain atlases
-
-dir_oasis = file.path(dir_cm, "OASIS_Atlases") # Location of ventricle atlases
 ```
 
 ```{r helper_funs, eval = TRUE}
@@ -139,7 +116,8 @@ pt <- function(tab){
   tab %>% pandoc.table(split.table = Inf)
 }
 
-# Get subject ID from a filename
+# Get the subject ID from any filename
+# (Adapt this to your own filenames)
 find_name <- function(strs){
   
   strs %>%
@@ -151,7 +129,7 @@ find_name <- function(strs){
 
 ```
 
-# Pre-processing
+# Pre-processing 
 
 First, we set up our folders and ensure that all of our MRI images and atlases are at the correct location. In our data, participants were split into Training/Test sets at the outset. If your images are all in one folder, simply ignore the lines with `dir_nifti_test`.
 
@@ -218,7 +196,7 @@ list.files(file.path(dir_oasis, "atlas/Raw_Uncorrected"), full.names = TRUE) %>%
 
 ## Multi-Atlas Label Fusion
 
-### Register PNC atlases/masks to T1
+### Register brain atlases/masks to T1
 
 ```{r}
 # Make directories for MALF output
@@ -280,8 +258,6 @@ register_it <- function(fname, atlas_files, mask_files, atlas_outfolder, mask_ou
     # Output registered images
     antsImageWrite(atlas_reg, atlas_out_dir)
     antsImageWrite(mask_reg, mask_out_dir)
-    
-    message("Finished atlas ", j)
   }
 }
 
@@ -395,6 +371,7 @@ make_folder(file.path(dir_nifti_test, "out/MALF_Brain"))
 
 # Majority voting
 # reg_mask_folder: name of the folder for one subject containing all of their registered masks
+# outfolder: directory for the majority-voted masks
 majority_vote <- function(reg_mask_folder, outfolder){
   
   target_name = basename(reg_mask_folder)
@@ -426,9 +403,9 @@ mclapply(X = list.files(file.path(dir_nifti_test, "mask/MALF"), full.names = TRU
          mc.cores = n_cores)
 ```
 
-### Skull Strip the T1s
+### Brain Segmentation of T1s
 
-Finally, we skull strip the T1s:
+Using the majority-voted brain masks, we remove the skull from the T1 images.
 
 ```{r}
 make_folder(file.path(dir_nifti_train, "T1/Strip_MALF"))
@@ -463,7 +440,7 @@ purrr::map2(.x = list.files(file.path(dir_nifti_test, "T1"), pattern = ".nii.gz"
 
 ## BET Segmentation
 
-BET Segmentation [@Smith2002] was not used in our pipeline, but was given as an alternative method of brain segmentation.
+BET Segmentation [@Smith2002] was not used in our pipeline, but we compared our results that of BET.
 
 ```{r}
 make_folder(file.path(dir_nifti_train, "out/BET_Brain"))
@@ -494,7 +471,7 @@ mclapply(X = list.files(file.path(dir_nifti_test, "T1"), pattern = ".nii.gz", fu
          outfolder = file.path(dir_nifti_test, "out/BET_Brain"),
          mc.cores = n_cores)
 
-# T1's from PNC
+# Does BET perform better on higher-resolution images?
 mclapply(X = list.files(file.path(dir_pnc, "atlas/Raw_Uncorrected"), pattern = ".nii.gz", full.names = TRUE),
          FUN = bet_seg,
          outfolder = file.path(dir_pnc, "out/BET_Brain"),
@@ -505,69 +482,6 @@ mclapply(X = list.files(file.path(dir_pnc, "atlas/Raw_Uncorrected"), pattern = "
 
 This was run in the BrainSuite app.
 
-## ANTs Segmentation
-
-ANTs Segmentation with Atropos [@Avants2011] was not used in our pipeline, but was given as an alternative method of brain segmentation.
-
-```{r}
-make_folder(file.path(dir_nifti_train, "out/ANTs_Brain"))
-make_folder(file.path(dir_nifti_test, "out/ANTs_Brain"))
-make_folder(file.path(dir_pnc, "out/ANTs_Brain"))
-
-# fname: path to NIFTI file
-# outfolder: output directory
-ants_seg <- function(fname, outfolder){
-
-  fname2 <- basename(fname)
-  brain <- readnii(fname)
-  
-  stripped = extrantsr::otropos2(
-    img = brain,
-    mask = brain > 0,
-    verbose = TRUE,
-    i = "KMeans[1]")
-  
-  writenii(stripped$segmentation, filename = paste0(outfolder, "/delete_kmeans.nii.gz"))
-  
-  message("Done")
-  table(stripped$segmentation)
-  mask = (stripped$segmentation == 1)
-  
-
-  ####################
-  
-  fname2 = basename(fname)
-  brain <- antsImageRead(fname)
-  brain_mask <- get_mask(brain)
-  
-  stripped <- atropos(a = brain, x = brain_mask)
-  message("Done")
-  mask <- readnii(paste0(outfolder, "/betstrip_", fname2)) > 0
-  writenii(mask, filename = paste0(outfolder, "/betmask_", fname2))
-}
-
-# Train T1s
-mclapply(X = list.files(file.path(dir_nifti_train, "T1"), pattern = ".nii.gz", full.names = TRUE)[1:2],
-         FUN = bet_seg,
-         outfolder = file.path(dir_nifti_train, "out/ANTs_Brain"),
-         mc.cores = n_cores)
-# Test T1s
-mclapply(X = list.files(file.path(dir_nifti_test, "T1"), pattern = ".nii.gz", full.names = TRUE),
-         FUN = bet_seg,
-         outfolder = file.path(dir_nifti_test, "out/ANTs_Brain"))
-
-# T1's from PNC
-list.files("/Users/dtu/Desktop/Cerebral\ Malaria/Training\ Set/NIFTI/atlas/Raw",
-           pattern = ".nii.gz", full.names = TRUE) %>%
-  map(bet_it_up, 
-      out.dir = "/Users/dtu/Desktop/Cerebral\ Malaria/Training\ Set/NIFTI/atlas/BET")
-
-```
-
-
-
-## Comparison:
-
 # Biomarkers
 
 ## Ventricular CSF Volume
@@ -576,7 +490,7 @@ To calculate ventricular CSF volume, we intersected a ventricle mask (using MALF
 
 ### OASIS Ventricle mask
 
-First, we register the OASIS atlases to the same space as the PNC atlases:
+To segment the ventricles in our brain images, we used the same approach as before (multi-atlas label fusion). First, we register the OASIS atlases to the same space as the brain atlases:
 
 ```{r}
 make_folder(file.path(dir_pnc, "atlas/Stripped"))
@@ -605,7 +519,7 @@ register_it_wrap(target_folder = file.path(dir_pnc, "atlas/Stripped"),
                  mask_outfolder= file.path(dir_oasis, "mask/Registered_to_PNC"))
 ```
 
-Next, we use MALF with majority voting to create one ventricle atlas per PNC atlas:
+Next, we use registration with majority voting to create one ventricle atlas per PNC atlas:
 
 ```{r}
 make_folder(file.path(dir_oasis, "mask/Ventricle_MALF"))
@@ -616,7 +530,7 @@ mclapply(X = list.files(file.path(dir_oasis, "mask/Registered_to_PNC"), pattern 
          mc.cores = n_cores)
 ```
 
-Then, we register these MALFed ventricle masks and PNC atlases to the cerebral malaria T1s, and perform MALF again to obtain a ventricle mask for each subject in our sample.
+Then, we register these majority-voted ventricle masks and PNC atlases to the cerebral malaria T1s, and perform MALF again to obtain a ventricle mask for each subject in our sample.
 
 ```{r}
 make_folder(file.path(dir_nifti_train, "atlas/Ventricle_MALF"))
@@ -850,6 +764,8 @@ make_folder(file.path(dir_nifti_test, "out/FSL_CSF"))
 
 # fname: filename of skull-stripped T2 image
 # csf_label: the label of the CSF class
+# fsl_fast_outdir: where to save the results of FSL FAST
+# fsl_csf_outdir: where to save the CSF mask itself
 fslfast <- function(fname, csf_label = NULL,
                     fsl_fast_outdir,
                     fsl_csf_outdir){
@@ -903,7 +819,7 @@ parallel::mclapply(X = list.files(file.path(dir_nifti_test, "T2/Strip_MALF"), fu
 
 ### Ventricular CSF Mask
 
-Then, the masks from 2.1.1 and 2.1.2 were intersected to produce ventricular CSF masks:
+Then, the masks from 2.1.1 (ventricle) and 2.1.2 (CSF) were intersected to produce ventricular CSF masks.
 
 ```{r}
 make_folder(file.path(dir_nifti_train, "out/Ventricle_CSF_T2"))
@@ -939,8 +855,6 @@ Finally, the first biomarker is calculated as the brain parenchymal fraction (BP
 # vent_csf_fname: path to ventricular CSF mask
 # brain_mask_fname: path to brain_mask_fname
 volume_fun <- function(vent_csf_fname, brain_mask_fname){
-  
-  message(find_name(vent_csf_fname))
   
   csf = readnii(vent_csf_fname)
   # CSF voxel resolution
@@ -997,95 +911,6 @@ rbind(b1_vent_csf_train, b1_vent_csf_test) %>%
 
 ```
 
-
-```{r echo = FALSE}
-
-# # Plot and display results
-# csf_output <- function(dat, 
-#                        xlabel = "1-(Proportion of Ventricular CSF)", 
-#                        ylabel = "Frequency",
-#                        filllabel = "Edema Score",
-#                        title_main = "Ventricular CSF by Edema Score Category",
-#                        title_pval = TRUE){
-#   stopifnot(("ID" %in% colnames(dat)) & ("BPF" %in% colnames(dat)))
-#   
-#   pandoc.table(dat, split.table = Inf)
-#   
-#   plot_title <- if (!title_pval){
-#     title_main
-#   } else {
-#     bpf1 <- dat %>%
-#       filter(Severe_Swelling == 0) %>%
-#       select(BPF) %>%
-#       `[[`(1)
-#     
-#     bpf2 <- dat %>%
-#     filter(Severe_Swelling == 1) %>%
-#       select(BPF) %>%
-#       `[[`(1)
-# 
-#     paste0(title_main, "\n", "p = ", round(t.test(bpf1, bpf2)$p.value, 4))
-#   }
-#   
-#   ggplot() +
-#   geom_histogram(data = dat %>% filter(Severe_Swelling == 1),
-#                  aes(x = BPF, fill = "7-8"), alpha = 0.5, bins = 20) +
-#   geom_histogram(data = dat %>% filter(Severe_Swelling == 0),
-#                  aes(x = BPF, fill = "1-6"), alpha = 0.5, bins = 20) +
-#   labs(fill = filllabel,
-#        x = xlabel,
-#        y = ylabel,
-#        title = plot_title) +
-#   scale_fill_manual(breaks = c("1-6", "7-8"),
-#                     values = c("steelblue3", "indianred3")) +
-#   theme_minimal()
-# }
-# 
-# # For CSF masks in csf_dir
-# # Brain masks in brainmask_dir
-# # Calculate the BPF for each pair of CSF/Brain mask
-# # Name the file based on patt
-# volume_output <- function(csf_dir, brainmask_dir, 
-#                           volume_outname, patt = "TRAIN"){
-#   # Get list of CSF masks
-#   csf_mask_list = list.files(csf_dir, pattern = ".nii.gz", full.names = TRUE) %>% 
-#     as.list()
-#   
-#   # Get list of brain masks
-#   brain_mask_list = list.files(brainmask_dir, pattern = ".nii.gz", full.names = TRUE) %>% 
-#     as.list()
-#   
-#   stopifnot(length(csf_mask_list) == length(brain_mask_list))
-#   
-#   # Map these into volume_fun and output a nice CSV with all the info
-#   map2(csf_mask_list, brain_mask_list, volume_fun, pattern = patt) %>%
-#   bind_rows %>%
-#   write.csv(file = volume_outname)
-#   
-#   message(paste0("File written to ", volume_outname))
-# }
-# 
-# # Read in a dataset from the volume_filename
-# # Plot the results
-# volume_plot <- function(volume_filename){
-#   dat <- read.csv(volume_filename) %>%
-#   select(ID,
-#          Volume_CSF,
-#          Volume_Brain,
-#          BPF) %>%
-#   left_join(dat_rat, by = "ID") %>%
-#   arrange(desc(Group)) %>%
-#   # Severe swelling indicator
-#   mutate(Severe_Swelling = ifelse(Group >= 7.0, 1, 0),
-#          Severe_Swelling = as.factor(Severe_Swelling))
-#   
-#   dat %>%
-#   csf_output(xlabel = "1 - (Proportion of Ventricular CSF)",
-#         title_main = "Ventricular CSF by Edema Score Category")
-# }
-
-```
-
 ## WhiteStripe Intensity
 
 Next, we normalize the voxel intensities within the brain using WhiteStripe:
@@ -1098,8 +923,10 @@ make_folder(file.path(dir_nifti_test, "T1/WhiteStriped"))
 make_folder(file.path(dir_nifti_test, "T2/WhiteStriped"))
 
 
+# Call WhiteStripe
 # fname: location of the skull-stripped T1s and T2
 # ws_outdir: location to save the WhiteStriped brain
+# the_type: modality (T1 or T2)
 ws_intensity_norm <- function(fname, ws_outdir, the_type = "T1"){
   brain <- readnii(fname)
   brain_ind <- whitestripe(img = brain, type = the_type)
@@ -1178,6 +1005,7 @@ image_summary <- function(fname, fun = mean, ...){
   return(data.frame(ID, out))
 }
 
+# WhiteStripe training data
 ws_t1a = map2(.x = list.files(file.path(dir_nifti_train, "T1/WhiteStriped"), full.names = T),
               .y = list.files(file.path(dir_nifti_train, "out/MALF_Brain"), full.names = T),
               ~image_summary(fname = .x, fun = mean, mask_fname = .y)) %>% 
@@ -1189,6 +1017,7 @@ ws_t2a = map2(.x = list.files(file.path(dir_nifti_train, "T2/WhiteStriped"), ful
   Reduce(rbind,.) %>%
   rename(WS_T2 = out)
 
+# WhiteStripe testing data
 ws_t1b = map2(.x = list.files(file.path(dir_nifti_test, "T1/WhiteStriped"), full.names = T),
               .y = list.files(file.path(dir_nifti_test, "out/MALF_Brain"), full.names = T),
               ~image_summary(fname = .x, fun = mean, mask_fname = .y)) %>% 
@@ -1206,8 +1035,8 @@ rbind(full_join(ws_t1a, ws_t2a, by = "ID"),
 
 ```
 
-```{r}
-# Revision analysis: also look at median WhiteStripe intensity
+```{r include = FALSE}
+# We also look at the median WhiteStripe intensity
 ws_t1a = map2(.x = list.files(file.path(dir_nifti_train, "T1/WhiteStriped"), full.names = T),
               .y = list.files(file.path(dir_nifti_train, "out/MALF_Brain"), full.names = T),
               ~image_summary(fname = .x, fun = median, mask_fname = .y)) %>% 
@@ -1233,53 +1062,22 @@ ws_t2b = map2(.x = list.files(file.path(dir_nifti_test, "T2/WhiteStriped"), full
 rbind(full_join(ws_t1a, ws_t2a, by = "ID"),
       full_join(ws_t1b, ws_t2b, by = "ID")) %>%
   write_csv(file.path(dir_cm, "Biomarkers/b2_ws_med.csv"))
-
-```
-
-
-```{r echo = FALSE}
-# # Thanks John Muschelli
-# plot_densities <- function(dens, swelling_ind,
-#                           xlab = "Raw Intensities", 
-#                           main = "Whole Brain",
-#                           range_x = NULL, range_y = NULL){
-#   
-#   if (missing(range_x)){
-#     range_x = sapply(dens, function(d) range(d$x))
-#     range_x = range(range_x)
-#   }
-#   
-#   if (missing(range_y)){
-#     range_y = sapply(dens, function(d) range(d$y))
-#     range_y = range(range_y)
-#   }
-#   
-#   line_color = ifelse(swelling_ind[1] == 1, "indianred3", "steelblue3")
-#   
-#   plot(dens[[1]], xlim = range_x, ylim = range_y, 
-#        xlab = xlab, main = main, col = alpha(line_color, 0.5))
-#   
-#   for (idens in 2:length(dens)) {
-#     line_color = ifelse(swelling_ind[idens] == 1, "indianred3", "steelblue3")
-#     lines(dens[[idens]], col = alpha(line_color, 0.5))
-#   }
-# }
-
 ```
 
 ## Hessian Filter
 
-Our final biomarker consists of capturing sulcal effacement via a Hessian "vesselness" filter.
+Our final biomarker consists of capturing sulcal effacement via a Hessian "vesselness" filter. Because the Hessian filter can be affected by the quality of the brain segmentation, we only looked at the Hessian filter within interior or "eroded" voxels of the brain.
 
-1. Get the middle section of T2's by chopping off the top and bottom 3 voxels in every T2.
+The eroded brain mask was obtained by the following:
+
+1. Get the middle section of T2's by removing the top and bottom 3 voxels in every T2.
 2. Do the same for the T2 skull-strip mask.
 3. Erode the T2 skull-strip masks so that the outside edges of the T2's are not included.
-4. *Hessian Filter* on the middle section of the T2's.
+4. Apply *Hessian Filter* on the middle section of the T2's.
 5. *Median Filter intensity*: Calculate the median intensity of the T2 Hessian Filter, but only within the brain as defined by the eroded mask in Step 3.
 
-First, we erode the brain mask on the T2s so that only the interior cerebellum is considered: this is to reduce noise in the Hessian filter.
-
 ```{r}
+# Erode the brain mask
 make_folder(file.path(dir_nifti_train, "out/MALF_erode_T2"))
 make_folder(file.path(dir_nifti_test, "out/MALF_erode_T2"))
 
@@ -1297,9 +1095,9 @@ map2(.x = list.files(file.path(dir_nifti_test, "out/MALF_Brain_T2"), full.names 
      ~fslerode(file = .x, outfile = .y))
 ```
 
-We further shrink the eroded masks by only considering the middle slices:
 
 ```{r}
+# Remove top and bottom slices
 make_folder(file.path(dir_nifti_train, "out/MALF_erode2_T2"))
 make_folder(file.path(dir_nifti_train, "T2/Strip_Mid"))
 make_folder(file.path(dir_nifti_test, "out/MALF_erode2_T2"))
@@ -1350,15 +1148,15 @@ list.files(file.path(dir_nifti_test, "T2/Strip_MALF"), full.names = TRUE, patter
        n_voxel_crop = 3)
 ```
 
-Finally, we apply the Hessian filter to the T2 scan, only within the region defined by the eroded and cropped brain mask.
-
 ```{r}
+# Hessian filter
 make_folder(file.path(dir_nifti_train, "out/Hessian"))
 make_folder(file.path(dir_nifti_test, "out/Hessian"))
 
 # Wrapper around hess_filter
 # fname: path to skull-stripped/eroded T2 image
 # hess_outdir: path to save the Hessian filter
+# min.scale/max.scale/hess_dim: other parameters depending on the features you're interested in
 hess_filter <- function(fname, min.scale = 0.5, max.scale = 0.5, hess_dim = 2, hess_outdir){
   img = readnii(fname)
   
@@ -1404,8 +1202,8 @@ rbind(hess_t2a, hess_t2b) %>%
   write_csv(file.path(dir_cm, "Biomarkers/b3_hessian.csv"))
 ```
 
-```{r}
-# Revision analyses: also look at mean
+```{r include = FALSE}
+# We also considered the mean intensity.
 hess_t2a = map2(.x = list.files(file.path(dir_nifti_train, "out/Hessian"), full.names = T),
               .y = list.files(file.path(dir_nifti_train, "out/MALF_erode2_T2"), full.names = T),
               ~image_summary(fname = .x, fun = mean, mask_fname = .y)) %>% 
@@ -1423,64 +1221,9 @@ rbind(hess_t2a, hess_t2b) %>%
   write_csv(file.path(dir_cm, "Biomarkers/b3_hessian_mean.csv"))
 ```
 
+# Prediction of Severe BV Score
 
-```{r echo = FALSE}
-
-# 
-# # Convert the image to an object
-# image_to_obj <- function(fname, type = "density", ...){
-#   brain_vals = image_to_values(fname = fname, ...)
-#   
-#   if (type == "density"){
-#     obj = density(brain_vals)
-#   }
-#   
-#   if (type == "histogram"){
-#     obj = hist(brain_vals)
-#   }
-#   
-#   return(obj)
-# }
-# 
-
-# 
-# frangi_plot <- function(run_folder){
-#   # Histogram of the frangi filters
-#   t1d_list <- list.files(paste0("/Users/dtu/Desktop/Cerebral Malaria/Training Set/NIFTI/out/",run_folder,"/T1"), 
-#                          pattern = ".nii.gz", full.names = TRUE) %>%
-#     as.list %>%
-#     map(image_to_obj)
-#   
-#   t2d_list <- list.files(paste0("/Users/dtu/Desktop/Cerebral Malaria/Training Set/NIFTI/out/",run_folder,"/T2"), 
-#                          pattern = ".nii.gz", full.names = TRUE)  %>%
-#     as.list %>%
-#     map(image_to_obj)
-#   # 
-#   # Plot
-#   plot_densities(t1d_list, 
-#                  t1_ss,
-#                  xlab = "Frangi-Net Mask Intensity",
-#                  main = "Frangi-Net Densities (T1) \n n = 49",
-#                  range_x = c(0-1,3))
-#   legend(1.75, 10, legend=c("7-8 (Severe)", "1-6"),
-#          title = "Edema Score",
-#          col=c("indianred3", "steelblue3"), lty=1, cex=0.8)
-#   
-#   plot_densities(t2d_list, 
-#                  t2_ss,
-#                  xlab = "Frangi-Net Mask Intensity",
-#                  main = "Frangi-Net Densities (T2) \n n = 48",
-#                  range_x = c(0-1,3))
-#   legend(1.75, 8, legend=c("7-8 (Severe)", "1-6"),
-#          title = "Edema Score",
-#          col=c("indianred3", "steelblue3"), lty=1, cex=0.8)
-# }
-
-```
-
-# Analysis
-
-## Combined Data
+## Combine all biomarker data
 
 ```{r}
 dat_b1 = read.csv(file.path(dir_cm, "Biomarkers/b1_vent_csf.csv"))
@@ -1498,13 +1241,11 @@ dat_all = inner_join(dat_b1, dat_b2, by = "ID") %>%
   mutate(Severe_Edema65 = (Group >= 6.5),
          Severe_Edema6 = (Group >= 6),
          Severe_Edema7 = (Group >= 7))
-```
 
-```{r include = FALSE}
 write_csv(dat_all, file.path(dir_cm, "combined_data.csv"))
 ```
 
-```{r}
+```{r include = FALSE}
 # Revised analyses
 dat_b1 = read.csv(file.path(dir_cm, "Biomarkers/b1_vent_csf.csv"))
 dat_b2 = read.csv(file.path(dir_cm, "Biomarkers/b2_ws.csv"))
@@ -1512,6 +1253,7 @@ dat_b2_rev = read.csv(file.path(dir_cm, "Biomarkers/b2_ws_med.csv"))
 dat_b3 = read.csv(file.path(dir_cm, "Biomarkers/b3_hessian.csv"))
 dat_b3_rev = read.csv(file.path(dir_cm, "Biomarkers/b3_hessian_mean.csv"))
 
+# In the revised data, consider different summary statistics (i.e., mean vs. median)
 dat_all_rev = inner_join(dat_b1, dat_b2, by = "ID") %>%
   inner_join(dat_b2_rev, by = "ID") %>%
   inner_join(dat_b3, by = "ID") %>%
@@ -1525,13 +1267,11 @@ dat_all_rev = inner_join(dat_b1, dat_b2, by = "ID") %>%
   mutate(Severe_Edema65 = (Group >= 6.5),
          Severe_Edema6 = (Group >= 6),
          Severe_Edema7 = (Group >= 7))
-```
 
-```{r include = FALSE}
 write_csv(dat_all_rev, file.path(dir_cm, "combined_data_rev.csv"))
 ```
 
-```{r start_running_everything, eval = TRUE, echo = FALSE}
+```{r start_running_everything, eval = TRUE}
 knitr::opts_chunk$set(echo = TRUE, eval = TRUE,
                       message = FALSE, warning = FALSE,
                       fig.align = "center", fig.width = 8, fig.height = 5,
@@ -1539,12 +1279,14 @@ knitr::opts_chunk$set(echo = TRUE, eval = TRUE,
 
 # Read in combined data
 dat_all = read.csv(file.path(dir_cm, "combined_data.csv"))
+dat_train = dat_all %>% filter(Source == "Train")
+dat_test = dat_all %>% filter(Source == "Test")
 
 # Biomarker names
 covs =  c("BPF", "WS_T1", "WS_T2", "Fr_T2")
 ```
 
-## Logistic Model {.tabset}
+## Logistic Model (Training Data) {.tabset}
 
 To predict severe cases, we used a logistic regression model:
 
@@ -1559,10 +1301,17 @@ where
 - $\gamma_3$ is the mean WhiteStripe (T2) intensity
 - $\gamma_4$ is the median Hessian Filter (T2) intensity
 
+These coefficients are estimated on the training data only:
+
 ```{r}
 # Newline
 nl <- function(){
   cat("  \n")
+}
+
+# Rounding and formatting figures
+roundf <- function(num, digits = 2){
+  format(round(x = num, digits = digits), nsmall = digits)
 }
 
 # Get outcome variable name given threshold
@@ -1612,6 +1361,51 @@ mod_fun <- function(dat_train, threshold = 7, covars = covs){
 
 ### t = 7
 
+This code will replicate Web Table 2 in the Supporting Information.
+
+```{r}
+fit = mod_fun(dat_train = dat_train, threshold = 7)
+
+stargazer(fit$fit, type = "html",
+          covariate.labels = get_covar_labs(fit$covars),
+          digits = 2, ci = TRUE, dep.var.labels = get_outcome_labs(thresh = 7))
+```
+
+```{r include = FALSE, eval = FALSE}
+stargazer(fit$fit, type = "text",
+          covariate.labels = get_covar_labs(fit$covars),
+          digits = 2, ci = TRUE, dep.var.labels = get_outcome_labs(thresh = 7))
+```
+
+
+### t = 6.5
+
+```{r}
+fit = mod_fun(dat_train = dat_train, threshold = 6.5)
+
+stargazer(fit$fit, type = "html",
+          covariate.labels = get_covar_labs(fit$covars),
+          digits = 2, ci = TRUE, dep.var.labels = get_outcome_labs(thresh = 6.5))
+```
+
+### t = 6
+
+```{r}
+fit = mod_fun(dat_train = dat_train, threshold = 6)
+
+stargazer(fit$fit, type = "html",
+          covariate.labels = get_covar_labs(fit$covars),
+          digits = 2, ci = TRUE, dep.var.labels = get_outcome_labs(thresh = 6))
+```
+
+## Logistic Model (Full Data) {.tabset}
+
+These coefficients are fit on the combined training and testing data ($n = 94$ images in total).
+
+### t = 7
+
+This will replicate Web Table 3 in the Supporting Information.
+
 ```{r}
 fit = mod_fun(dat_train = dat_all, threshold = 7)
 
@@ -1627,7 +1421,7 @@ fit = mod_fun(dat_train = dat_all, threshold = 6.5)
 
 stargazer(fit$fit, type = "html",
           covariate.labels = get_covar_labs(fit$covars),
-          digits = 2, ci = TRUE, dep.var.labels = get_outcome_labs(thresh = 7))
+          digits = 2, ci = TRUE, dep.var.labels = get_outcome_labs(thresh = 6.5))
 ```
 
 ### t = 6
@@ -1637,12 +1431,12 @@ fit = mod_fun(dat_train = dat_all, threshold = 6)
 
 stargazer(fit$fit, type = "html",
           covariate.labels = get_covar_labs(fit$covars),
-          digits = 2, ci = TRUE, dep.var.labels = get_outcome_labs(thresh = 7))
+          digits = 2, ci = TRUE, dep.var.labels = get_outcome_labs(thresh = 6))
 ```
 
-## Accuracy: Original Train/Test Sets {.tabset}
+## Prediction Accuracy (Original Train/Test Sets) {.tabset}
 
-The logistic model was fit on the Training Data and then prediction accuracy was assessed on the Testing Data.
+The logistic model was fit on the Training Data and then prediction accuracy was assessed on the Testing Data. The following will replicate Table 1 in the main paper.
 
 ```{r}
 dat_test = dat_all %>% filter(Source == "Test")
@@ -1703,10 +1497,10 @@ model_auc <- function(dat_test, dat_train, thresh = 7,
   
   out_form = out %>% mutate(Threshold = thresh,
                             Covariates = form0,
-                 AUC_train = paste0(round(Train_AUC, 2), " (", round(Train_AUC_Lower, 2), ",",
-                                    round(Train_AUC_Upper, 2),  ")"), 
-                 AUC_test = paste0(round(Test_AUC, 2), " (", round(Test_AUC_Lower, 2), ",",
-                                    round(Test_AUC_Upper, 2),  ")")) %>%
+                 AUC_train = paste0(roundf(Train_AUC, 2), " (", roundf(Train_AUC_Lower, 2), ",",
+                                    roundf(Train_AUC_Upper, 2),  ")"), 
+                 AUC_test = paste0(roundf(Test_AUC, 2), " (", roundf(Test_AUC_Lower, 2), ",",
+                                    roundf(Test_AUC_Upper, 2),  ")")) %>%
     select(Threshold:AUC_test)
   
   return(list(out, out_form))
@@ -1744,16 +1538,18 @@ model_auc(dat_test = dat_test, dat_train = dat_train,
           thresh = 6, covariates = "Fr_T2")[[2]] %>% pt()
 ```
 
-# Sensitivity Analyses
+## Prediction Accuracy (Nested CV)
 
-## Accuracy: Cross-Validation {.tabset}
-
-To ensure that our prediction accuracy results are not due to the differences between the Training and Test sets, we assess sensitivity, specificity, AUC, etc. using 10-fold cross-validation implemented in the `caret` and `MEval` packages.
+To show that model performance does not depend on the original Train/Test sets, we also assess performance using 5-fold nested cross-validation. In the inner loop, an optimal cutoff is found for the logistic model. In the outer loop, prediction accuracy was assessed. The following will replicate Table in the main paper. 
 
 ```{r}
-model_auc_cv10 <- function(folds = 10, reps = 1, dat_all, thresh, covariates){
+# All covariates
+covs = c("BPF", "WS_T1", "WS_T2", "Fr_T2")
+
+model_auc_cv10 <- function(folds = 10, reps = 1, dat_all, outcome_var, covariates,
+                           show_plots = TRUE, return_mod = FALSE){
   
-  outcome_var2 = sym(get_outcome_var(thresh = thresh))
+  outcome_var2 = sym(outcome_var)
 
   # Convert outcome from logical to factor
   dat_all2 = dat_all %>%
@@ -1770,79 +1566,117 @@ model_auc_cv10 <- function(folds = 10, reps = 1, dat_all, thresh, covariates){
   model <- train(form = form, data = dat_all2, method = "glm", family = binomial,
                  trControl = train.control)
   
-  nl()
-  model_auc = evalm(model, plots = "r")
-  nl()
-
-  model_auc$optres[[1]] %>%
-    pandoc.table(split.table = Inf)
-  nl()
+  # Print plots?
+  if (show_plots){
+    
+    nl()
+    model_auc = evalm(model, plots = "r")
+    nl()
+    
+    model_auc$optres[[1]] %>%
+      pandoc.table(split.table = Inf)
+    nl()
+  }
+  
+  # Return model?
+  if (return_mod){
+    return(model)
+  }
 }
+
+# Nested CV outer loop
+# dat_split: the data split into pieces
+# Set aside the ith part as validation
+# Use all other parts to fit the CV model
+nested_cv_outer <- function(dat_split, i, n_splits, outcome_var, covariates){
+  stopifnot(i <= length(dat_split))
+  
+  dat_val = dat_split[[i]]
+  dat_cv = dat_split[-i] %>%
+    bind_rows()
+  
+  # Fit model on CV
+  mod_cv <- model_auc_cv10(folds = n_splits-1, reps = 1, dat_all = dat_cv, outcome_var = outcome_var, 
+                 covariates = covariates, show_plots = FALSE, return_mod = TRUE)
+  
+  # Predict on validation data
+  pred_val <- predict(mod_cv, newdata = dat_val)
+  
+  true_ratings = ifelse(dat_val[, outcome_var], "Severe", "NonSevere") %>% factor
+  
+  # Calculate sens, spec, etc. 
+  # No AUC because the threshold was determined using cross-validation.
+  sens = caret::sensitivity(data = pred_val, reference =true_ratings) %>% round(2)
+  spec = caret::specificity(data = pred_val, reference =true_ratings) %>% round(2)
+  ppv = caret::posPredValue(data = pred_val, reference =true_ratings) %>% round(2)
+  npv = caret::negPredValue(data = pred_val, reference =true_ratings) %>% round(2)
+  younden_j = (sens + spec - 1) %>% round(2)
+
+  
+  return(data.frame(sens, spec, ppv, npv, younden_j))
+}
+
+# dat_all: combined data
+# n_splits: number of splits (1 is the validation set, the rest are for fitting the model using CV)
+nested_cv <- function(dat_all, n_splits = 5, outcome_var = "Severe_Edema7", covariates = covs){
+  
+  # Split the data into splits pieces
+  split_inds0 = rep(1:n_splits, each = ceiling(nrow(dat_all)/n_splits), length.out = nrow(dat_all))
+  split_inds = sample(split_inds0, size = length(split_inds0), replace = FALSE)
+  dat_split = split(x = dat_all, f = split_inds)
+  
+  # For each split, run nested_cv_outer()
+  results0 = (1:length(dat_split)) %>%
+    map(nested_cv_outer, dat_split = dat_split, n_splits = n_splits,
+        outcome_var = outcome_var, covariates = covariates) %>%
+    bind_rows %>%
+    gather(Variable, Value)
+  
+  results = results0 %>% group_by(Variable) %>% 
+    summarize(mean = mean(Value),
+              sd = sd(Value)) %>%
+    rowwise %>%
+    mutate(CI_L = max(0, mean - 1.96*sd),
+           CI_U = min(1, mean + 1.96*sd),
+           Value_Formatted = paste0(roundf(mean, 2), " (", roundf(CI_L, 2), ",", roundf(CI_U, 2), ")")) %>%
+    select(Variable, Value_Formatted) %>%
+    pivot_wider(names_from = Variable, values_from = Value_Formatted) %>%
+    mutate(Outcome = outcome_var,
+           Covariates = paste0(covariates, collapse = " + ")) %>%
+    select(Outcome, Covariates, everything())
+  
+  return(results)
+
+}
+
+nested_cv_all <- function(dat_all, n_splits = 5){
+  out = bind_rows(nested_cv(dat_all, n_splits = n_splits, outcome_var = "Severe_Edema7", covariates = covs),
+            nested_cv(dat_all, n_splits = n_splits, outcome_var = "Severe_Edema7", covariates = "Fr_T2"),
+            nested_cv(dat_all, n_splits = n_splits, outcome_var = "Severe_Edema65", covariates = covs),
+            nested_cv(dat_all, n_splits = n_splits, outcome_var = "Severe_Edema65", covariates = "Fr_T2"),
+            nested_cv(dat_all, n_splits = n_splits, outcome_var = "Severe_Edema6", covariates = covs),
+            nested_cv(dat_all, n_splits = n_splits, outcome_var = "Severe_Edema6", covariates = "Fr_T2"))
+  return(out)
+}
+
 ```
 
-### t = 7
-
-#### All covariates
-
 ```{r}
-set.seed(123423)
-model_auc_cv10(folds = 10, reps = 1, dat_all = dat_all,
-               thresh = 7, covariates = covs)
-```
+# Making this into a LaTeX table
+set.seed(321321)
 
-#### Hessian only
+tab = nested_cv_all(dat_all, n_splits = 5)
 
-```{r}
-model_auc_cv10(folds = 10, reps = 1,  dat_all = dat_all,
-               thresh = 7, covariates = "Fr_T2")
-```
-
-### t = 6.5
-
-#### All covariates
-
-```{r}
-model_auc_cv10(folds = 10, reps = 1,  dat_all = dat_all,
-               thresh = 6.5, covariates = covs)
-```
-
-#### Hessian only
-
-```{r}
-model_auc_cv10(folds = 10, reps = 1,  dat_all = dat_all,
-               thresh = 6.5, covariates = "Fr_T2")
-```
-
-### t = 6
-
-#### All covariates
-
-```{r}
-model_auc_cv10(folds = 10, reps = 1,  dat_all = dat_all,
-               thresh = 6, covariates = covs)
-```
-
-#### Hessian only
-
-```{r}
-model_auc_cv10(folds = 10, reps = 1,  dat_all = dat_all,
-               thresh = 6, covariates = "Fr_T2")
+tab %>%
+  select(Outcome, Covariates, Sensitivity = sens, Specificity = spec, Youden_J = younden_j,
+         npv, ppv) %>%
+  kableExtra::kable(., format = "latex") %>%
+  kableExtra::kable_styling()
 ```
 
 # Figures {.tabset}
 
-### Distribution of Scores
-
-```{r eval = TRUE, fig.height = 4}
-ggplot(dat_all) +
-  geom_histogram(aes(x = Group, fill = Severe_Edema7), bins = 8) +
-  scale_x_continuous(breaks=1:8) +
-  scale_fill_manual(breaks = c("TRUE", "FALSE"), values = c("#D55E00", "#56B4E9")) +
-  facet_wrap(~Source) +
-  labs(x = "Brain Volume Score", y = "Frequency")
-```
-
-### Distribution of Biomarkers
+## Distribution of Biomarkers
 
 ```{r eval = TRUE}
 get_outcome <- function(threshold = 7){
@@ -1857,43 +1691,58 @@ bio_dist_plot <- function(dat_all, threshold = 7){
   # BPF
   p1 = ggplot(dat_all) +
     geom_histogram(aes_string(x = "BPF", fill = out_var), bins = 20, alpha = 0.6, position="identity") +
-    scale_fill_manual(breaks = c("TRUE", "FALSE"), values = c("#D55E00", "#56B4E9")) +
-    labs(x = "BPF", y = "Count", fill = paste0("Severe Edema\n(BV geq ", threshold, ")"))
+    scale_fill_manual(breaks = c("TRUE", "FALSE"), values = c("#D55E00", "#56B4E9"),
+                      labels = c(paste0("Highly Increased BV (BV geq ", threshold, ")"), "Non-severe")) +
+    labs(x = "BPF", y = "Count", fill = "") +
+    theme_minimal() +
+    theme(legend.position = "bottom")
   
   # WhiteStripe
   p2 = ggplot(dat_all) +
     geom_histogram(aes_string(x = "WS_T1", fill = out_var), bins = 20, alpha = 0.6, position="identity") +
-    scale_fill_manual(breaks = c("TRUE", "FALSE"), values = c("#D55E00", "#56B4E9")) +
-    labs(x = "Mean WhiteStripe Intensity (T1)", y = "Count", fill = paste0("Severe Edema\n(BV geq ", threshold, ")"))
+        scale_fill_manual(breaks = c("TRUE", "FALSE"), values = c("#D55E00", "#56B4E9"),
+                      labels = c(paste0("Highly Increased BV (BV geq ", threshold, ")"), "Non-severe")) +
+    labs(x = "Mean WhiteStripe Intensity (T1)", y = "Count", fill = "") +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  
   p3 = ggplot(dat_all) +
     geom_histogram(aes_string(x = "WS_T2", fill = out_var), bins = 20, alpha = 0.6, position="identity") +
-    scale_fill_manual(breaks = c("TRUE", "FALSE"), values = c("#D55E00", "#56B4E9")) +
-    labs(x = "Mean WhiteStripe Intensity (T2)", y = "Count", fill = paste0("Severe Edema\n(BV geq ", threshold, ")"))
+        scale_fill_manual(breaks = c("TRUE", "FALSE"), values = c("#D55E00", "#56B4E9"),
+                      labels = c(paste0("Highly Increased BV (BV geq ", threshold, ")"), "Non-severe")) +
+    labs(x = "Mean WhiteStripe Intensity (T2)", y = "Count", fill = "") +
+    theme_minimal() +
+    theme(legend.position = "bottom")
   
   # HEssian
   p4 = ggplot(dat_all) +
     geom_histogram(aes_string(x = "Fr_T2", fill = out_var), bins = 20, alpha = 0.6, position="identity") +
-    scale_fill_manual(breaks = c("TRUE", "FALSE"), values = c("#D55E00", "#56B4E9")) +
-    labs(x = "Median Hessian Filter Intensity (T2)", y = "Count", fill = paste0("Severe Edema\n(BV geq ", threshold, ")"))
+        scale_fill_manual(breaks = c("TRUE", "FALSE"), values = c("#D55E00", "#56B4E9"),
+                      labels = c(paste0("Highly Increased BV (BV geq ", threshold, ")"), "Non-severe")) +
+    labs(x = "Median Hessian Filter Intensity (T2)", y = "Count", fill = "") +
+    theme_minimal() +
+    theme(legend.position = "bottom")
   
   grid.arrange(p1, p2, p3, p4, nrow = 2)
 }
 
 ```
 
-#### Threshold = 7
+### Threshold = 7
+
+This replicates Figure 2 in the main paper.
 
 ```{r eval = TRUE}
 bio_dist_plot(dat_all, threshold = 7)
 ```
 
-#### Threshold = 6.5
+### Threshold = 6.5
 
 ```{r eval = TRUE}
 bio_dist_plot(dat_all, threshold = 6.5)
 ```
 
-#### Threshold = 6
+### Threshold = 6
 
 ```{r eval = TRUE}
 bio_dist_plot(dat_all, threshold = 6)
