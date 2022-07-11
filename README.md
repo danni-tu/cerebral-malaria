@@ -1,6 +1,7 @@
 # Automated Analysis of Low-Field Brain MRI in Cerebral Malaria
 
-[Link to pre-print on bioRxiv.](https://www.biorxiv.org/content/10.1101/2020.12.23.424020v3)
+[This paper is now published in Biometrics.](https://onlinelibrary.wiley.com/doi/10.1111/biom.13708)
+[View the preprint here.](https://www.biorxiv.org/content/10.1101/2020.12.23.424020v3)
 
 This is a fully automated framework for translating radiological diagnostic criteria into image-based biomarkers of brain edema (swelling), inspired by a project in which children with cerebral malaria were imaged using low-field 0.35 Tesla MRI. 
 
